@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  BIDDER
+  BUYER
+  ADMIN
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+}
+
+model User {
+  id              Int            @id @default(autoincrement())
+  username        String         @unique
+  email           String         @unique
+  password        String
+  role            UserRole       @default(BUYER)
+  firstName       String?
+  lastName        String?
+  phone           String?
+  address         Json?
+  reviewsGiven    Review[]       @relation("reviewsGiven")
+  reviewsReceived Review[]       @relation("reviewsReceived")
+  products        Product[]      @relation("UserProducts")
+  bids            Bid[]
+  ordersAsBuyer   Order[]        @relation("buyer")
+  ordersAsSeller  Order[]        @relation("seller")
+  messages        Message[]      @relation("UserMessages")
+  notifications   Notification[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  Watchlist       Watchlist[]
+  CartItem        CartItem[]
+  Dispute         Dispute[]
+}
+
+model Product {
+  id            String            @id @default(cuid())
+  title         String
+  description   String
+  seller        String
+  imageUrl      String
+  category      String            // Keep for backward compatibility
+  condition     String
+  location      String
+  listingType   String
+  startingPrice Float
+  currentPrice  Float
+  buyNowPrice   Float?
+  endDate       DateTime
+  user          User              @relation("UserProducts", fields: [userId], references: [id])
+  userId        Int
+  bids          Bid[]
+  orders        Order[]
+  watchlistedBy Watchlist[]
+  categories    ProductCategory[] // New many-to-many relationship
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  CartItem      CartItem[]
+}
+
+model Bid {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+  maxBid    Float
+  timestamp DateTime @default(now())
+}
+
+model Order {
+  id                 String    @id @default(cuid())
+  product            Product   @relation(fields: [productId], references: [id])
+  productId          String
+  productTitle       String
+  seller             User      @relation("seller", fields: [sellerId], references: [id])
+  sellerId           Int
+  buyer              User      @relation("buyer", fields: [buyerId], references: [id])
+  buyerId            Int
+  finalPrice         Float
+  purchaseDate       DateTime  @default(now())
+  status             String
+  reviewLeftByBuyer  Boolean   @default(false)
+  reviewLeftBySeller Boolean   @default(false)
+  reviews            Review[]
+  Dispute            Dispute[]
+}
+
+model Review {
+  id         String   @id @default(cuid())
+  order      Order    @relation(fields: [orderId], references: [id])
+  orderId    String
+  reviewer   User     @relation("reviewsGiven", fields: [reviewerId], references: [id])
+  reviewerId Int
+  reviewee   User     @relation("reviewsReceived", fields: [revieweeId], references: [id])
+  revieweeId Int
+  rating     Int
+  comment    String?
+  timestamp  DateTime @default(now())
+}
+
+model Conversation {
+  id             String    @id @default(cuid())
+  participantIds Int[]
+  productId      String
+  productTitle   String
+  lastMessage    Message?  @relation("ConversationLastMessage", fields: [lastMessageId], references: [id])
+  lastMessageId  String?   @unique
+  messages       Message[] @relation("ConversationMessages")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model Message {
+  id                 String        @id @default(cuid())
+  conversation       Conversation  @relation("ConversationMessages", fields: [conversationId], references: [id])
+  conversationId     String
+  lastInConversation Conversation? @relation("ConversationLastMessage")
+  sender             User          @relation("UserMessages", fields: [senderId], references: [id])
+  senderId           Int
+  text               String
+  timestamp          DateTime      @default(now())
+  isRead             Boolean       @default(false)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  type      String
+  message   String
+  relatedId String
+  title     String
+  isRead    Boolean  @default(false)
+  timestamp DateTime @default(now())
+}
+
+model Watchlist {
+  id        Int     @id @default(autoincrement())
+  user      User    @relation(fields: [userId], references: [id])
+  userId    Int
+  product   Product @relation(fields: [productId], references: [id])
+  productId String
+
+  @@unique([userId, productId])
+}
+
+model CartItem {
+  id        Int     @id @default(autoincrement())
+  user      User    @relation(fields: [userId], references: [id])
+  userId    Int
+  product   Product @relation(fields: [productId], references: [id])
+  productId String
+  quantity  Int     @default(1)
+
+  @@unique([userId, productId])
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  description String?
+  products    ProductCategory[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model ProductCategory {
+  id         Int      @id @default(autoincrement())
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId  String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  categoryId String
+
+  @@unique([productId, categoryId])
+}
+
+model Dispute {
+  id           String        @id @default(cuid())
+  order        Order         @relation(fields: [orderId], references: [id])
+  orderId      String
+  productTitle String
+  user         User          @relation(fields: [userId], references: [id])
+  userId       Int
+  reason       String
+  status       DisputeStatus @default(OPEN)
+  createdAt    DateTime      @default(now())
+}
