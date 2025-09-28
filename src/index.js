@@ -500,8 +500,14 @@ async function initializeAndStart() {
     const runMigrations = process.env.RUN_MIGRATIONS_ON_BOOT !== 'false';
     if (runMigrations) {
       console.log('[startup] Applying Prisma migrations (deploy)...');
-      await exec('npx prisma migrate deploy');
-      console.log('[startup] Migrations applied.');
+      try {
+        const { stdout, stderr } = await exec('npx prisma migrate deploy');
+        if (stdout) console.log('[prisma:migrate:stdout]\n' + stdout);
+        if (stderr) console.warn('[prisma:migrate:stderr]\n' + stderr);
+        console.log('[startup] Migrations applied.');
+      } catch (err) {
+        console.error('[startup] Prisma migrate deploy failed:', err?.stderr || err?.message || err);
+      }
     } else {
       console.log('[startup] Skipping migrations (RUN_MIGRATIONS_ON_BOOT=false)');
     }
@@ -509,14 +515,18 @@ async function initializeAndStart() {
     if (process.env.RUN_SEED_ON_BOOT === 'true') {
       console.log('[startup] Seeding database...');
       try {
-        await exec('node create-test-users.js');
+        const res1 = await exec('node create-test-users.js');
+        if (res1.stdout) console.log('[seed:create-test-users:stdout]\n' + res1.stdout);
+        if (res1.stderr) console.warn('[seed:create-test-users:stderr]\n' + res1.stderr);
       } catch (e) {
-        console.error('[startup] create-test-users failed:', e);
+        console.error('[startup] create-test-users failed:', e?.stderr || e?.message || e);
       }
       try {
-        await exec('node prisma/seed.js');
+        const res2 = await exec('node prisma/seed.js');
+        if (res2.stdout) console.log('[seed:prisma-seed:stdout]\n' + res2.stdout);
+        if (res2.stderr) console.warn('[seed:prisma-seed:stderr]\n' + res2.stderr);
       } catch (e) {
-        console.error('[startup] prisma/seed failed:', e);
+        console.error('[startup] prisma/seed failed:', e?.stderr || e?.message || e);
       }
       console.log('[startup] Seed complete.');
     }
