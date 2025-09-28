@@ -38,6 +38,7 @@ model User {
   ordersAsSeller  Order[]        @relation("seller")
   messages        Message[]      @relation("UserMessages")
   notifications   Notification[]
+  newsAuthored    News[]
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   Watchlist       Watchlist[]
@@ -197,4 +198,37 @@ model Dispute {
   reason       String
   status       DisputeStatus @default(OPEN)
   createdAt    DateTime      @default(now())
+}
+
+// Content monetization models
+
+model News {
+  id          String   @id @default(cuid())
+  title       String
+  slug        String   @unique
+  excerpt     String?
+  content     String
+  imageUrl    String?
+  published   Boolean  @default(false)
+  publishedAt DateTime?
+  author      User     @relation(fields: [authorId], references: [id])
+  authorId    Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Ad {
+  id          String   @id @default(cuid())
+  title       String
+  advertiser  String?
+  imageUrl    String?
+  targetUrl   String
+  placement   String   // e.g. homepage-hero, sidebar, banner-top
+  isActive    Boolean  @default(true)
+  startDate   DateTime?
+  endDate     DateTime?
+  impressions Int      @default(0)
+  clicks      Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }
