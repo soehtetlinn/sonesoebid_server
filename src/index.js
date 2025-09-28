@@ -31,6 +31,13 @@ function auth(req, res, next) {
   try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
+
 // Login with email/username and password
 app.post('/api/login', async (req, res) => {
   try {
@@ -489,6 +496,88 @@ app.get('/api/users/:id/disputes', async (req, res) => {
   const userId = Number(req.params.id);
   const disputes = await prisma.dispute.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } });
   res.json(disputes);
+});
+
+// News (public read)
+app.get('/api/news', async (req, res) => {
+  const list = await prisma.news.findMany({ where: { published: true }, orderBy: { publishedAt: 'desc' } });
+  res.json(list);
+});
+app.get('/api/news/:slug', async (req, res) => {
+  const item = await prisma.news.findUnique({ where: { slug: req.params.slug } });
+  if (!item || !item.published) return res.status(404).json({ error: 'Not found' });
+  res.json(item);
+});
+
+// News (admin CRUD)
+app.get('/api/admin/news', auth, requireAdmin, async (req, res) => {
+  const list = await prisma.news.findMany({ orderBy: { createdAt: 'desc' } });
+  res.json(list);
+});
+app.post('/api/admin/news', auth, requireAdmin, async (req, res) => {
+  const { title, slug, excerpt, content, imageUrl, published } = req.body;
+  const item = await prisma.news.create({ data: {
+    title, slug, excerpt, content, imageUrl, published: !!published,
+    publishedAt: published ? new Date() : null,
+    authorId: req.user.id
+  }});
+  res.status(201).json(item);
+});
+app.patch('/api/admin/news/:id', auth, requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const data = req.body;
+  if (data.published && !data.publishedAt) data.publishedAt = new Date();
+  const item = await prisma.news.update({ where: { id }, data });
+  res.json(item);
+});
+app.delete('/api/admin/news/:id', auth, requireAdmin, async (req, res) => {
+  await prisma.news.delete({ where: { id: req.params.id } });
+  res.json(true);
+});
+
+// Ads
+app.get('/api/ads', async (req, res) => {
+  const now = new Date();
+  const list = await prisma.ad.findMany({
+    where: {
+      isActive: true,
+      OR: [
+        { startDate: null },
+        { startDate: { lte: now } }
+      ],
+      OR: [
+        { endDate: null },
+        { endDate: { gte: now } }
+      ]
+    },
+    orderBy: { createdAt: 'desc' }
+  });
+  res.json(list);
+});
+app.post('/api/ads/:id/impression', async (req, res) => {
+  const ad = await prisma.ad.update({ where: { id: req.params.id }, data: { impressions: { increment: 1 } } });
+  res.json({ ok: true, impressions: ad.impressions });
+});
+app.post('/api/ads/:id/click', async (req, res) => {
+  const ad = await prisma.ad.update({ where: { id: req.params.id }, data: { clicks: { increment: 1 } } });
+  res.json({ ok: true, clicks: ad.clicks });
+});
+
+// Ads (admin CRUD)
+app.get('/api/admin/ads', auth, requireAdmin, async (req, res) => {
+  res.json(await prisma.ad.findMany({ orderBy: { createdAt: 'desc' } }));
+});
+app.post('/api/admin/ads', auth, requireAdmin, async (req, res) => {
+  const ad = await prisma.ad.create({ data: req.body });
+  res.status(201).json(ad);
+});
+app.patch('/api/admin/ads/:id', auth, requireAdmin, async (req, res) => {
+  const ad = await prisma.ad.update({ where: { id: req.params.id }, data: req.body });
+  res.json(ad);
+});
+app.delete('/api/admin/ads/:id', auth, requireAdmin, async (req, res) => {
+  await prisma.ad.delete({ where: { id: req.params.id } });
+  res.json(true);
 });
 
 const PORT = process.env.PORT || 4000;
