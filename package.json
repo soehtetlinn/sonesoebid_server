@@ -9,6 +9,9 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",
     "start": "node ./src/index.js",
+    "start:prod": "node ./src/index.js",
+    "prestart:prod": "prisma migrate deploy",
+    "seed": "node create-test-users.js && node prisma/seed.js",
     "postinstall": "prisma generate"
   },
   "prisma": {

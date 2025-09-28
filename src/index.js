@@ -6,6 +6,10 @@ import jwt from 'jsonwebtoken';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import bcrypt from 'bcryptjs';
+import { exec as _exec } from 'child_process';
+import util from 'util';
+
+const exec = util.promisify(_exec);
 
 const app = express();
 const server = http.createServer(app);
@@ -491,9 +495,41 @@ app.get('/api/users/:id/disputes', async (req, res) => {
   res.json(disputes);
 });
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`API listening on :${PORT}`);
-});
+async function initializeAndStart() {
+  try {
+    const runMigrations = process.env.RUN_MIGRATIONS_ON_BOOT !== 'false';
+    if (runMigrations) {
+      console.log('[startup] Applying Prisma migrations (deploy)...');
+      await exec('npx prisma migrate deploy');
+      console.log('[startup] Migrations applied.');
+    } else {
+      console.log('[startup] Skipping migrations (RUN_MIGRATIONS_ON_BOOT=false)');
+    }
+
+    if (process.env.RUN_SEED_ON_BOOT === 'true') {
+      console.log('[startup] Seeding database...');
+      try {
+        await exec('node create-test-users.js');
+      } catch (e) {
+        console.error('[startup] create-test-users failed:', e);
+      }
+      try {
+        await exec('node prisma/seed.js');
+      } catch (e) {
+        console.error('[startup] prisma/seed failed:', e);
+      }
+      console.log('[startup] Seed complete.');
+    }
+  } catch (e) {
+    console.error('[startup] Initialization error:', e);
+  } finally {
+    const PORT = process.env.PORT || 4000;
+    server.listen(PORT, () => {
+      console.log(`API listening on :${PORT}`);
+    });
+  }
+}
+
+initializeAndStart();
 
 
