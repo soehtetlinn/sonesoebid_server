@@ -1,0 +1,120 @@
+{
+  "info": {
+    "name": "Sonesoebid API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "request": { "method": "GET", "url": "{{baseUrl}}/api/health" }
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"admin@example.com\",\n  \"password\": \"password123\"\n}" },
+            "url": "{{baseUrl}}/api/login"
+          }
+        },
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"username\": \"testuser\",\n  \"email\": \"test@example.com\",\n  \"password\": \"password123\"\n}" },
+            "url": "{{baseUrl}}/api/register"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Public Content",
+      "item": [
+        { "name": "News (list)", "request": { "method": "GET", "url": "{{baseUrl}}/api/news" } },
+        { "name": "News by slug", "request": { "method": "GET", "url": "{{baseUrl}}/api/news/:slug" } },
+        { "name": "News categories", "request": { "method": "GET", "url": "{{baseUrl}}/api/news-categories" } },
+        { "name": "Ads (list)", "request": { "method": "GET", "url": "{{baseUrl}}/api/ads" } }
+      ]
+    },
+    {
+      "name": "Admin Content (News)",
+      "item": [
+        {
+          "name": "List News",
+          "request": {
+            "method": "GET",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+            "url": "{{baseUrl}}/api/admin/news"
+          }
+        },
+        {
+          "name": "Create News",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" }, { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"title\": \"Sample News\",\n  \"slug\": \"sample-news\",\n  \"excerpt\": \"short\",\n  \"content\": \"body\",\n  \"published\": true\n}" },
+            "url": "{{baseUrl}}/api/admin/news"
+          }
+        },
+        {
+          "name": "Upload News Images",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+            "body": { "mode": "formdata", "formdata": [ { "key": "images", "type": "file", "src": [] } ] },
+            "url": "{{baseUrl}}/api/admin/news/{{adminNewsId}}/images"
+          }
+        },
+        {
+          "name": "Add News Videos",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" }, { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"youtubeIds\": [\"dQw4w9WgXcQ\"]\n}" },
+            "url": "{{baseUrl}}/api/admin/news/{{adminNewsId}}/videos"
+          }
+        },
+        {
+          "name": "Reorder Images",
+          "request": {
+            "method": "PATCH",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" }, { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"imageIds\": [\"{{imageId}}\"]\n}" },
+            "url": "{{baseUrl}}/api/admin/news/{{adminNewsId}}/images/reorder"
+          }
+        },
+        {
+          "name": "Reorder Videos",
+          "request": {
+            "method": "PATCH",
+            "header": [ { "key": "Authorization", "value": "Bearer {{token}}" }, { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"videoDbIds\": [\"{{videoDbId}}\"]\n}" },
+            "url": "{{baseUrl}}/api/admin/news/{{adminNewsId}}/videos/reorder"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin Metrics",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": "{{baseUrl}}/api/admin/metrics"
+      }
+    },
+    {
+      "name": "User Stats",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "url": "{{baseUrl}}/api/users/1/stats"
+      }
+    }
+  ]
+}
+
+

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
+import multer from 'multer';
 import jwt from 'jsonwebtoken';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -15,6 +16,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: '*'} });
 const prisma = new PrismaClient();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 5 } });
 
 app.use(cors());
 app.use(express.json());
@@ -24,6 +26,34 @@ io.on('connection', (socket) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+// Helper: convert News to DTO with imageIds
+async function newsToDTOWithImages(news) {
+  const images = await prisma.newsImage.findMany({
+    where: { newsId: news.id },
+    select: { id: true, position: true },
+    orderBy: { position: 'asc' }
+  });
+  const imageIds = images.map(i => i.id);
+  const videos = await prisma.newsVideo.findMany({
+    where: { newsId: news.id },
+    select: { id: true, youtubeId: true, position: true },
+    orderBy: { position: 'asc' }
+  });
+  const videoIds = videos.map(v => v.youtubeId);
+  const videosSimple = videos.map(v => ({ id: v.id, youtubeId: v.youtubeId }));
+  let category = null;
+  if (news.categoryId) {
+    const c = await prisma.newsCategory.findUnique({ where: { id: news.categoryId }, select: { id: true, name: true } });
+    category = c;
+  }
+  // Get author information
+  const author = await prisma.user.findUnique({ 
+    where: { id: news.authorId }, 
+    select: { id: true, username: true, firstName: true, lastName: true } 
+  });
+  return { ...news, imageIds, videoIds, videos: videosSimple, category, author };
+}
+
 
 // Auth utils
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme-dev';
@@ -35,11 +65,66 @@ function auth(req, res, next) {
   try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
+// Helper function to get user roles (primary + assigned roles)
+async function getUserRoles(userId) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      roleAssignments: {
+        where: { isActive: true },
+        select: { role: true }
+      }
+    }
+  });
+  
+  if (!user) return [];
+  
+  const roles = [user.role]; // Primary role
+  user.roleAssignments.forEach(assignment => {
+    if (!roles.includes(assignment.role)) {
+      roles.push(assignment.role);
+    }
+  });
+  
+  return roles;
+}
+
+// Helper function to check if user has specific role
+async function hasRole(userId, role) {
+  const roles = await getUserRoles(userId);
+  return roles.includes(role);
+}
+
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'ADMIN') {
     return res.status(403).json({ error: 'Forbidden' });
   }
   next();
+}
+
+function requireModeratorOrAdmin(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  // Check if user has ADMIN or MODERATOR role
+  if (req.user.role === 'ADMIN' || req.user.role === 'MODERATOR') {
+    return next();
+  }
+  
+  // For now, we'll check the primary role. Later we can enhance this to check multiple roles
+  return res.status(403).json({ error: 'Moderator or Admin access required' });
+}
+
+function requireSelfOrAdmin(req, res, next) {
+  try {
+    const paramId = Number(req.params.id);
+    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+    if (req.user.role === 'ADMIN' || req.user.id === paramId) return next();
+    return res.status(403).json({ error: 'Forbidden' });
+  } catch {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 }
 
 // Login with email/username and password
@@ -83,17 +168,21 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
+    // Get all user roles (primary + assigned)
+    const userRoles = await getUserRoles(user.id);
+    
     // Generate JWT token
     const token = signToken({ 
       id: user.id, 
       email: user.email, 
       username: user.username,
-      role: user.role 
+      role: user.role, // Primary role for backward compatibility
+      roles: userRoles // All roles
     });
     
     // Return user without password
     const { password: _, ...userWithoutPassword } = user;
-    res.json({ token, user: userWithoutPassword });
+    res.json({ token, user: { ...userWithoutPassword, roles: userRoles } });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -192,6 +281,20 @@ app.get('/api/users/:id', async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id } });
   if (!user) return res.status(404).json({ error: 'Not found' });
   res.json(user);
+});
+
+// User dashboard stats
+app.get('/api/users/:id/stats', auth, requireSelfOrAdmin, async (req, res) => {
+  const userId = Number(req.params.id);
+  const now = new Date();
+  const bids = await prisma.bid.findMany({
+    where: { userId, product: { endDate: { gt: now } } },
+    select: { productId: true }
+  });
+  const activeBids = new Set(bids.map(b => b.productId)).size;
+  const itemsWon = await prisma.order.count({ where: { buyerId: userId } });
+  const watching = await prisma.watchlist.count({ where: { userId } });
+  res.json({ activeBids, itemsWon, watching });
 });
 
 app.patch('/api/users/:id', async (req, res) => {
@@ -446,6 +549,26 @@ app.get('/api/categories', async (req, res) => {
   res.json(categories);
 });
 
+// News categories (admin-only CRUD, public list)
+app.get('/api/news-categories', async (req, res) => {
+  const list = await prisma.newsCategory.findMany({ orderBy: { name: 'asc' } });
+  res.json(list);
+});
+app.post('/api/admin/news-categories', auth, requireModeratorOrAdmin, async (req, res) => {
+  const { name, description } = req.body;
+  const cat = await prisma.newsCategory.create({ data: { name, description } });
+  res.status(201).json(cat);
+});
+app.patch('/api/admin/news-categories/:id', auth, requireModeratorOrAdmin, async (req, res) => {
+  const { name, description } = req.body;
+  const cat = await prisma.newsCategory.update({ where: { id: req.params.id }, data: { name, description } });
+  res.json(cat);
+});
+app.delete('/api/admin/news-categories/:id', auth, requireModeratorOrAdmin, async (req, res) => {
+  await prisma.newsCategory.delete({ where: { id: req.params.id } });
+  res.json(true);
+});
+
 app.post('/api/categories', async (req, res) => {
   try {
     const { name, description } = req.body;
@@ -504,37 +627,53 @@ app.get('/api/users/:id/disputes', async (req, res) => {
 
 // News (public read)
 app.get('/api/news', async (req, res) => {
-  const list = await prisma.news.findMany({ where: { published: true }, orderBy: { publishedAt: 'desc' } });
-  res.json(list);
+  const { q, categoryId } = req.query;
+  const where = { published: true };
+  if (categoryId) where.categoryId = String(categoryId);
+  if (q) {
+    where.OR = [
+      { title: { contains: String(q), mode: 'insensitive' } },
+      { excerpt: { contains: String(q), mode: 'insensitive' } },
+      { content: { contains: String(q), mode: 'insensitive' } },
+    ];
+  }
+  const list = await prisma.news.findMany({ where, orderBy: { publishedAt: 'desc' } });
+  const withImages = await Promise.all(list.map(newsToDTOWithImages));
+  res.json(withImages);
 });
 app.get('/api/news/:slug', async (req, res) => {
   const item = await prisma.news.findUnique({ where: { slug: req.params.slug } });
   if (!item || !item.published) return res.status(404).json({ error: 'Not found' });
-  res.json(item);
+  const dto = await newsToDTOWithImages(item);
+  res.json(dto);
 });
 
 // News (admin CRUD)
-app.get('/api/admin/news', auth, requireAdmin, async (req, res) => {
+app.get('/api/admin/news', auth, requireModeratorOrAdmin, async (req, res) => {
   const list = await prisma.news.findMany({ orderBy: { createdAt: 'desc' } });
-  res.json(list);
+  const withImages = await Promise.all(list.map(newsToDTOWithImages));
+  res.json(withImages);
 });
-app.post('/api/admin/news', auth, requireAdmin, async (req, res) => {
-  const { title, slug, excerpt, content, imageUrl, published } = req.body;
+app.post('/api/admin/news', auth, requireModeratorOrAdmin, async (req, res) => {
+  const { title, slug, excerpt, content, imageUrl, published, categoryId } = req.body;
   const item = await prisma.news.create({ data: {
     title, slug, excerpt, content, imageUrl, published: !!published,
     publishedAt: published ? new Date() : null,
-    authorId: req.user.id
+    authorId: req.user.id,
+    categoryId: categoryId || null
   }});
-  res.status(201).json(item);
+  const dto = await newsToDTOWithImages(item);
+  res.status(201).json(dto);
 });
-app.patch('/api/admin/news/:id', auth, requireAdmin, async (req, res) => {
+app.patch('/api/admin/news/:id', auth, requireModeratorOrAdmin, async (req, res) => {
   const id = req.params.id;
   const data = req.body;
   if (data.published && !data.publishedAt) data.publishedAt = new Date();
   const item = await prisma.news.update({ where: { id }, data });
-  res.json(item);
+  const dto = await newsToDTOWithImages(item);
+  res.json(dto);
 });
-app.delete('/api/admin/news/:id', auth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/news/:id', auth, requireModeratorOrAdmin, async (req, res) => {
   await prisma.news.delete({ where: { id: req.params.id } });
   res.json(true);
 });
@@ -584,6 +723,209 @@ app.delete('/api/admin/ads/:id', auth, requireAdmin, async (req, res) => {
   res.json(true);
 });
 
+// Admin metrics
+app.get('/api/admin/metrics', auth, requireAdmin, async (req, res) => {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  try {
+    const [totalUsers, activeListings, totalBidsToday, salesAgg] = await Promise.all([
+      prisma.user.count(),
+      prisma.product.count({ where: { endDate: { gt: now } } }),
+      prisma.bid.count({ where: { timestamp: { gte: startOfToday } } }),
+      prisma.order.aggregate({ _sum: { finalPrice: true }, where: { purchaseDate: { gte: since24h } } })
+    ]);
+    const sales24h = salesAgg._sum.finalPrice || 0;
+    // Fallback guards in case of unexpected zeros
+    let ensuredUsers = totalUsers;
+    if (ensuredUsers === 0) {
+      const probe = await prisma.user.findMany({ select: { id: true }, take: 1 });
+      if (probe.length > 0) {
+        ensuredUsers = (await prisma.user.findMany({ select: { id: true } })).length;
+      }
+    }
+    res.json({ totalUsers: ensuredUsers, activeListings, totalBidsToday, sales24h });
+  } catch (e) {
+    console.error('[metrics] error', e);
+    res.status(500).json({ totalUsers: 0, activeListings: 0, totalBidsToday: 0, sales24h: 0 });
+  }
+});
+
+// News images: stream by id
+app.get('/api/news-images/:id', async (req, res) => {
+  try {
+    const img = await prisma.newsImage.findUnique({ where: { id: req.params.id } });
+    if (!img) return res.status(404).end();
+    res.setHeader('Content-Type', img.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(Buffer.from(img.data));
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load image' });
+  }
+});
+
+// Admin: upload up to 5 images for a news item
+app.post('/api/admin/news/:id/images', auth, requireModeratorOrAdmin, upload.array('images', 5), async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    if (!news) return res.status(404).json({ error: 'News not found' });
+
+    const existing = await prisma.newsImage.count({ where: { newsId } });
+    const toUpload = Array.isArray(req.files) ? req.files : [];
+    if (existing + toUpload.length > 5) {
+      return res.status(400).json({ error: 'Maximum 5 images per news' });
+    }
+
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+    let positionBase = existing;
+    const created = [];
+    for (const f of toUpload) {
+      if (!allowed.has(f.mimetype)) {
+        return res.status(400).json({ error: `Unsupported mime type: ${f.mimetype}` });
+      }
+      const rec = await prisma.newsImage.create({ data: {
+        newsId,
+        data: f.buffer,
+        mimeType: f.mimetype,
+        position: positionBase++
+      }});
+      created.push(rec);
+    }
+
+    const dto = await newsToDTOWithImages(news);
+    res.status(201).json(dto);
+  } catch (e) {
+    console.error('Upload images error:', e);
+    res.status(500).json({ error: 'Failed to upload images' });
+  }
+});
+
+// Admin: delete an image from a news item
+app.delete('/api/admin/news/:id/images/:imageId', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const imageId = req.params.imageId;
+    const img = await prisma.newsImage.findUnique({ where: { id: imageId } });
+    if (!img || img.newsId !== newsId) return res.status(404).json({ error: 'Image not found' });
+
+    await prisma.newsImage.delete({ where: { id: imageId } });
+
+    // Normalize positions after deletion
+    const remaining = await prisma.newsImage.findMany({ where: { newsId }, orderBy: { position: 'asc' } });
+    for (let i = 0; i < remaining.length; i++) {
+      if (remaining[i].position !== i) {
+        await prisma.newsImage.update({ where: { id: remaining[i].id }, data: { position: i } });
+      }
+    }
+
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    const dto = await newsToDTOWithImages(news);
+    res.json(dto);
+  } catch (e) {
+    console.error('Delete image error:', e);
+    res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
+// Admin: reorder images by array of imageIds
+app.patch('/api/admin/news/:id/images/reorder', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const imageIds = Array.isArray(req.body?.imageIds) ? req.body.imageIds : [];
+    if (imageIds.length === 0) return res.status(400).json({ error: 'imageIds array required' });
+    const images = await prisma.newsImage.findMany({ where: { newsId } });
+    const setIds = new Set(images.map(i => i.id));
+    for (const id of imageIds) {
+      if (!setIds.has(id)) return res.status(400).json({ error: `Image ${id} does not belong to this news` });
+    }
+    for (let i = 0; i < imageIds.length; i++) {
+      await prisma.newsImage.update({ where: { id: imageIds[i] }, data: { position: i } });
+    }
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    const dto = await newsToDTOWithImages(news);
+    res.json(dto);
+  } catch (e) {
+    console.error('Reorder images error:', e);
+    res.status(500).json({ error: 'Failed to reorder images' });
+  }
+});
+
+// Admin: add YouTube videos (array of youtubeIds)
+app.post('/api/admin/news/:id/videos', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    if (!news) return res.status(404).json({ error: 'News not found' });
+
+    const ids = Array.isArray(req.body?.youtubeIds) ? req.body.youtubeIds : [];
+    if (ids.length === 0) return res.status(400).json({ error: 'youtubeIds array required' });
+
+    const existing = await prisma.newsVideo.count({ where: { newsId } });
+    let pos = existing;
+    const validate = (s) => /^[A-Za-z0-9_-]{6,}$/.test(s);
+    for (const yid of ids) {
+      if (!validate(String(yid))) return res.status(400).json({ error: `Invalid YouTube id: ${yid}` });
+      await prisma.newsVideo.create({ data: { newsId, youtubeId: String(yid), position: pos++ } });
+    }
+
+    const dto = await newsToDTOWithImages(news);
+    res.status(201).json(dto);
+  } catch (e) {
+    console.error('Add videos error:', e);
+    res.status(500).json({ error: 'Failed to add videos' });
+  }
+});
+
+// Admin: delete one YouTube video by its DB id
+app.delete('/api/admin/news/:id/videos/:videoDbId', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const videoDbId = req.params.videoDbId;
+    const v = await prisma.newsVideo.findUnique({ where: { id: videoDbId } });
+    if (!v || v.newsId !== newsId) return res.status(404).json({ error: 'Video not found' });
+    await prisma.newsVideo.delete({ where: { id: videoDbId } });
+
+    // Re-order
+    const remaining = await prisma.newsVideo.findMany({ where: { newsId }, orderBy: { position: 'asc' } });
+    for (let i = 0; i < remaining.length; i++) {
+      if (remaining[i].position !== i) {
+        await prisma.newsVideo.update({ where: { id: remaining[i].id }, data: { position: i } });
+      }
+    }
+
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    const dto = await newsToDTOWithImages(news);
+    res.json(dto);
+  } catch (e) {
+    console.error('Delete video error:', e);
+    res.status(500).json({ error: 'Failed to delete video' });
+  }
+});
+
+// Admin: reorder videos by array of videoDbIds
+app.patch('/api/admin/news/:id/videos/reorder', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const newsId = req.params.id;
+    const videoDbIds = Array.isArray(req.body?.videoDbIds) ? req.body.videoDbIds : [];
+    if (videoDbIds.length === 0) return res.status(400).json({ error: 'videoDbIds array required' });
+    const videos = await prisma.newsVideo.findMany({ where: { newsId } });
+    const setIds = new Set(videos.map(v => v.id));
+    for (const id of videoDbIds) {
+      if (!setIds.has(id)) return res.status(400).json({ error: `Video ${id} does not belong to this news` });
+    }
+    for (let i = 0; i < videoDbIds.length; i++) {
+      await prisma.newsVideo.update({ where: { id: videoDbIds[i] }, data: { position: i } });
+    }
+    const news = await prisma.news.findUnique({ where: { id: newsId } });
+    const dto = await newsToDTOWithImages(news);
+    res.json(dto);
+  } catch (e) {
+    console.error('Reorder videos error:', e);
+    res.status(500).json({ error: 'Failed to reorder videos' });
+  }
+});
+
 async function initializeAndStart() {
   try {
     const runMigrations = process.env.RUN_MIGRATIONS_ON_BOOT !== 'false';
@@ -618,6 +960,22 @@ async function initializeAndStart() {
         console.error('[startup] prisma/seed failed:', e?.stderr || e?.message || e);
       }
       console.log('[startup] Seed complete.');
+    }
+    // Seed default news categories if none exist
+    const newsCatCount = await prisma.newsCategory.count();
+    if (newsCatCount === 0) {
+      const created = await prisma.$transaction([
+        prisma.newsCategory.create({ data: { name: 'Announcements', description: 'Latest updates and announcements' } }),
+        prisma.newsCategory.create({ data: { name: 'Guides', description: 'How-tos and tutorials' } }),
+        prisma.newsCategory.create({ data: { name: 'Market', description: 'Marketplace news and insights' } })
+      ]);
+      // Bind existing news to categories round-robin
+      const allNews = await prisma.news.findMany();
+      for (let i = 0; i < allNews.length; i++) {
+        const c = created[i % created.length];
+        await prisma.news.update({ where: { id: allNews[i].id }, data: { categoryId: c.id } });
+      }
+      console.log('[startup] Seeded news categories and bound to existing news.');
     }
   } catch (e) {
     console.error('[startup] Initialization error:', e);

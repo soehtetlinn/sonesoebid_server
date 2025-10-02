@@ -13,6 +13,7 @@ enum UserRole {
   BIDDER
   BUYER
   ADMIN
+  MODERATOR
 }
 
 enum DisputeStatus {
@@ -26,7 +27,7 @@ model User {
   username        String         @unique
   email           String         @unique
   password        String
-  role            UserRole       @default(BUYER)
+  role            UserRole       @default(BUYER) // Primary role for backward compatibility
   firstName       String?
   lastName        String?
   phone           String?
@@ -40,6 +41,7 @@ model User {
   messages        Message[]      @relation("UserMessages")
   notifications   Notification[]
   newsAuthored    News[]
+  roleAssignments UserRoleAssignment[]
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   Watchlist       Watchlist[]
@@ -214,8 +216,12 @@ model News {
   publishedAt DateTime?
   author      User     @relation(fields: [authorId], references: [id])
   authorId    Int
+  category    NewsCategory? @relation(fields: [categoryId], references: [id])
+  categoryId  String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  images      NewsImage[]
+  videos      NewsVideo[]
 }
 
 model Ad {
@@ -232,4 +238,46 @@ model Ad {
   clicks      Int      @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+/// Images attached to News entries, stored as binary blobs in Postgres
+model NewsImage {
+  id        String  @id @default(cuid())
+  news      News    @relation(fields: [newsId], references: [id], onDelete: Cascade)
+  newsId    String
+  data      Bytes
+  mimeType  String
+  position  Int     @default(0)
+  createdAt DateTime @default(now())
+}
+
+/// YouTube videos attached to News entries
+model NewsVideo {
+  id        String  @id @default(cuid())
+  news      News    @relation(fields: [newsId], references: [id], onDelete: Cascade)
+  newsId    String
+  youtubeId String
+  position  Int     @default(0)
+  createdAt DateTime @default(now())
+}
+
+model NewsCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  description String?
+  news      News[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserRoleAssignment {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    Int
+  role      UserRole
+  assignedBy Int?    // User ID who assigned this role
+  assignedAt DateTime @default(now())
+  isActive  Boolean  @default(true)
+
+  @@unique([userId, role])
 }
