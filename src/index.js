@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
@@ -14,11 +16,29 @@ const exec = util.promisify(_exec);
 
 const app = express();
 const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: { origin: '*'} });
+
+// CORS allowlist (comma-separated in env) with sensible default
+const allowedOrigins = (process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : ['https://www.shltechent.com']);
+
+const io = new SocketIOServer(server, { cors: { origin: allowedOrigins, methods: ['GET','POST'] } });
 const prisma = new PrismaClient();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 5 } });
 
-app.use(cors());
+// Trust proxy for correct rate-limit IPs (useful behind reverse proxies)
+app.set('trust proxy', 1);
+
+// Security headers (keep CSP off for now to avoid breaking inline scripts/importmap)
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// Restrictive CORS
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // allow same-origin/no-origin (curl, mobile apps)
+    return allowedOrigins.includes(origin) ? callback(null, true) : callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET','POST','PATCH','DELETE'],
+  credentials: true,
+}));
 app.use(express.json());
 io.on('connection', (socket) => {
   socket.on('joinConvo', (convoId) => socket.join(`convo:${convoId}`));
@@ -102,18 +122,18 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function requireModeratorOrAdmin(req, res, next) {
+async function requireModeratorOrAdmin(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  
-  // Check if user has ADMIN or MODERATOR role
-  if (req.user.role === 'ADMIN' || req.user.role === 'MODERATOR') {
-    return next();
+  try {
+    const isAdmin = await hasRole(req.user.id, 'ADMIN');
+    const isModerator = await hasRole(req.user.id, 'MODERATOR');
+    if (isAdmin || isModerator) return next();
+    return res.status(403).json({ error: 'Moderator or Admin access required' });
+  } catch {
+    return res.status(403).json({ error: 'Moderator or Admin access required' });
   }
-  
-  // For now, we'll check the primary role. Later we can enhance this to check multiple roles
-  return res.status(403).json({ error: 'Moderator or Admin access required' });
 }
 
 function requireSelfOrAdmin(req, res, next) {
@@ -126,6 +146,11 @@ function requireSelfOrAdmin(req, res, next) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 }
+
+// Rate limiting for auth endpoints
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
 
 // Login with email/username and password
 app.post('/api/login', async (req, res) => {
