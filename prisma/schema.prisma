@@ -42,6 +42,7 @@ model User {
   notifications   Notification[]
   newsAuthored    News[]
   roleAssignments UserRoleAssignment[]
+  exchangeRates   ExchangeRate[]
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   Watchlist       Watchlist[]
@@ -280,4 +281,28 @@ model UserRoleAssignment {
   isActive  Boolean  @default(true)
 
   @@unique([userId, role])
+}
+
+/// Exchange rates parsed from text messages
+model ExchangeRate {
+  id           String   @id @default(cuid())
+  base         String
+  quote        String
+  buyRate      Int?
+  sellRate     Int?
+  // Tiered per 100k MMK rates
+  buyBelow1mPer100k  Int?
+  buyAbove1mPer100k  Int?
+  sellBelow1mPer100k Int?
+  sellAbove1mPer100k Int?
+  sourceText   String
+  sellSamples  Json?
+  buySamples   Json?
+  allSamples   Json?
+  parsedAt     DateTime @default(now())
+  createdBy    User     @relation(fields: [createdById], references: [id])
+  createdById  Int
+  createdAt    DateTime @default(now())
+
+  @@index([base, quote, createdAt])
 }

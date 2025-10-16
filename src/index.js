@@ -214,6 +214,75 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// Google Sign-In (ID token) authentication
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+    if (!idToken || !GOOGLE_CLIENT_ID) return res.status(400).json({ error: 'missing_token_or_client_id' });
+
+    // Verify ID token with Google tokeninfo endpoint
+    const verifyUrl = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
+    const resp = await fetch(verifyUrl);
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => String(resp.status));
+      console.warn('[google-auth] tokeninfo error', resp.status, text);
+      return res.status(401).json({ error: 'invalid_google_token', detail: String(text).slice(0, 256) });
+    }
+    const payload = await resp.json();
+    // Basic checks
+    if (payload.aud !== GOOGLE_CLIENT_ID) {
+      console.warn('[google-auth] aud mismatch', { expected: GOOGLE_CLIENT_ID, got: payload.aud });
+      return res.status(401).json({ error: 'audience_mismatch' });
+    }
+    const email = String(payload.email || '').toLowerCase();
+    const emailVerified = String(payload.email_verified || 'false') === 'true';
+    const sub = String(payload.sub || '');
+    const givenName = payload.given_name || null;
+    const familyName = payload.family_name || null;
+    if (!email || !emailVerified || !sub) {
+      console.warn('[google-auth] unverified_or_missing_claims', { email, emailVerified, hasSub: !!sub });
+      return res.status(401).json({ error: 'unverified_account' });
+    }
+
+    // Upsert user by email
+    let user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      const usernameBase = email.split('@')[0] || `google_${sub.slice(-6)}`;
+      let username = usernameBase.toLowerCase();
+      // Ensure unique username
+      let counter = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const exists = await prisma.user.findFirst({ where: { username } });
+        if (!exists) break;
+        counter += 1;
+        username = `${usernameBase}${counter}`.toLowerCase();
+      }
+      // Create with random password
+      const randomPw = await bcrypt.hash(`google_${sub}_${Date.now()}`, 10);
+      user = await prisma.user.create({
+        data: {
+          email,
+          username,
+          password: randomPw,
+          firstName: givenName,
+          lastName: familyName,
+          role: 'BUYER'
+        }
+      });
+    }
+
+    const userRoles = await getUserRoles(user.id);
+    const token = signToken({ id: user.id, email: user.email, username: user.username, role: user.role, roles: userRoles });
+    const { password: _pw, ...userWithoutPassword } = user;
+    res.json({ token, user: { ...userWithoutPassword, roles: userRoles } });
+  } catch (e) {
+    console.error('[google-auth] unexpected', e);
+    res.status(500).json({ error: 'google_auth_failed' });
+  }
+});
+
 // Register new user
 app.post('/api/register', async (req, res) => {
   try {
@@ -322,11 +391,53 @@ app.get('/api/users/:id/stats', auth, requireSelfOrAdmin, async (req, res) => {
   res.json({ activeBids, itemsWon, watching });
 });
 
-app.patch('/api/users/:id', async (req, res) => {
+app.patch('/api/users/:id', auth, requireSelfOrAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const data = req.body;
+  const data = { ...req.body };
+  // Never allow raw password updates here; use dedicated password routes
+  if (data.password) delete data.password;
   const user = await prisma.user.update({ where: { id }, data });
   res.json(user);
+});
+
+// Self/admin password change for a user
+app.patch('/api/users/:id/password', auth, requireSelfOrAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { currentPassword, newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    const isAdminUser = req.user && req.user.role === 'ADMIN';
+    if (!isAdminUser) {
+      // Verify current password for self-service change
+      const existing = await prisma.user.findUnique({ where: { id } });
+      if (!existing) return res.status(404).json({ error: 'User not found' });
+      const ok = await bcrypt.compare(String(currentPassword || ''), existing.password);
+      if (!ok) return res.status(401).json({ error: 'Current password incorrect' });
+    }
+    const hashed = await bcrypt.hash(String(newPassword), 10);
+    await prisma.user.update({ where: { id }, data: { password: hashed } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
+// Admin reset password for any user (no current password required)
+app.patch('/api/admin/users/:id/password', auth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    const hashed = await bcrypt.hash(String(newPassword), 10);
+    await prisma.user.update({ where: { id }, data: { password: hashed } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
 });
 
 app.post('/api/users', async (req, res) => {
@@ -949,6 +1060,100 @@ app.patch('/api/admin/news/:id/videos/reorder', auth, requireModeratorOrAdmin, a
     console.error('Reorder videos error:', e);
     res.status(500).json({ error: 'Failed to reorder videos' });
   }
+});
+
+// =========================
+// FX parsing and endpoints (stored in News.content JSON)
+// =========================
+
+function parseFxFromText(text) {
+  const sourceText = String(text || '');
+  const normalized = sourceText.replace(/[,\s]+/g, ' ').replace(/[၊\-–—]+/g, ' ').toLowerCase();
+  // Extract numbers that look like rates (3-4 digits)
+  const numberRegex = /(\d{2,3,4})(?:\/(\d{2,3,4}))?/g;
+  const picks = [];
+  let m;
+  while ((m = numberRegex.exec(sourceText)) !== null) {
+    const a = parseInt(m[1], 10);
+    const b = m[2] ? parseInt(m[2], 10) : null;
+    if (!isNaN(a)) picks.push(a);
+    if (b && !isNaN(b)) picks.push(b);
+  }
+  // Heuristics: detect selling and buying blocks
+  const sellBlockMatch = sourceText.match(/Selling[^\n]*([\s\S]*?)(?:Buying|$)/i);
+  const buyBlockMatch = sourceText.match(/Buying[^\n]*([\s\S]*?)(?:$)/i);
+  const extractNums = (block) => {
+    if (!block) return [];
+    const arr = [];
+    let mm;
+    const r = /(\d{3,4})(?:[\/\-](\d{3,4}))?/g;
+    while ((mm = r.exec(block)) !== null) {
+      const x = parseInt(mm[1], 10);
+      const y = mm[2] ? parseInt(mm[2], 10) : null;
+      if (!isNaN(x)) arr.push(x);
+      if (y && !isNaN(y)) arr.push(y);
+    }
+    return arr;
+  };
+  const sellNums = extractNums(sellBlockMatch ? sellBlockMatch[1] : null);
+  const buyNums = extractNums(buyBlockMatch ? buyBlockMatch[1] : null);
+  const avg = (arr) => arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length) : null;
+  const sellRate = sellNums.length ? avg(sellNums) : (picks.length ? avg(picks) : null);
+  const buyRate = buyNums.length ? avg(buyNums) : (picks.length ? avg(picks) : null);
+  // Tiered extraction heuristics for 1,000,000 MMK threshold, per 100,000 MMK terms
+  const mmkAboveRegex = /(10\s*[သစ]ိန္႔|၁၀\s*သိန္း).*?(\d{3,4})(?:[\/\-](\d{3,4}))?/i; // above 1M
+  const mmkBelowRegex = /(10\s*[သစ]ိန္႔|၁၀\s*သိန္း).*?အောက်.*?(\d{3,4})/i; // below 1M
+  const buyLine = /Buying|အဝယ်/i.test(sourceText) ? (buyBlockMatch ? buyBlockMatch[1] : sourceText) : sourceText;
+  const sellLine = /Selling|အရောင်း/i.test(sourceText) ? (sellBlockMatch ? sellBlockMatch[1] : sourceText) : sourceText;
+  const parseTier = (s, isSell) => {
+    let above = null, below = null;
+    const a = mmkAboveRegex.exec(s);
+    if (a) {
+      const x = parseInt(a[3] || a[2], 10);
+      if (!isNaN(x)) above = x;
+    }
+    const b = mmkBelowRegex.exec(s);
+    if (b) {
+      const y = parseInt(b[2], 10);
+      if (!isNaN(y)) below = y;
+    }
+    return { above, below };
+  };
+  const buyT = parseTier(buyLine, false);
+  const sellT = parseTier(sellLine, true);
+  return { sourceText, sellRate, buyRate, sellSamples: sellNums, buySamples: buyNums, allSamples: picks, parsedAt: new Date().toISOString(), buyAbove1mPer100k: buyT.above, buyBelow1mPer100k: buyT.below, sellAbove1mPer100k: sellT.above, sellBelow1mPer100k: sellT.below };
+}
+
+// Create from text and store as ExchangeRate (admin/moderator)
+app.post('/api/admin/fx/parse', auth, requireModeratorOrAdmin, async (req, res) => {
+  try {
+    const { text, base = 'THB', quote = 'MMK' } = req.body || {};
+    if (!(String(base).toUpperCase() === 'THB' && String(quote).toUpperCase() === 'MMK')) {
+      return res.status(400).json({ error: 'pair_not_allowed', allowed: 'THB/MMK' });
+    }
+    if (!text) return res.status(400).json({ error: 'text_required' });
+    const parsed = parseFxFromText(text);
+    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById: req.user.id } });
+    res.status(201).json({ id: item.id, base: item.base, quote: item.quote, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt, createdAt: item.createdAt });
+  } catch (e) {
+    console.error('[fx/parse] error', e);
+    res.status(500).json({ error: 'fx_parse_failed' });
+  }
+});
+
+// List recent FX entries (admin)
+app.get('/api/admin/fx', auth, requireModeratorOrAdmin, async (req, res) => {
+  const list = await prisma.exchangeRate.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
+  res.json(list);
+});
+
+// Public: latest FX for a pair
+app.get('/api/fx/latest', async (req, res) => {
+  const base = 'THB';
+  const quote = 'MMK';
+  const item = await prisma.exchangeRate.findFirst({ where: { base, quote }, orderBy: { createdAt: 'desc' } });
+  if (!item) return res.status(404).json({ error: 'not_found' });
+  res.json({ base, quote, updatedAt: item.createdAt, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt });
 });
 
 async function initializeAndStart() {
