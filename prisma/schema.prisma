@@ -295,6 +295,10 @@ model ExchangeRate {
   buyAbove1mPer100k  Int?
   sellBelow1mPer100k Int?
   sellAbove1mPer100k Int?
+  sellSpecial100to500 String?
+  paymentMethod   String?
+  dateText        String?
+  notes           Json?
   sourceText   String
   sellSamples  Json?
   buySamples   Json?
@@ -305,4 +309,22 @@ model ExchangeRate {
   createdAt    DateTime @default(now())
 
   @@index([base, quote, createdAt])
+}
+
+// Lightweight support chat for Currex site
+model WebChatSession {
+  id            String           @id @default(cuid())
+  sessionKey    String           @unique
+  createdAt     DateTime         @default(now())
+  lastActivityAt DateTime        @updatedAt
+  messages      WebChatMessage[]
+}
+
+model WebChatMessage {
+  id         String          @id @default(cuid())
+  session    WebChatSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId  String
+  author     String          // 'client' | 'admin'
+  text       String
+  timestamp  DateTime        @default(now())
 }

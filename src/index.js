@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -46,6 +47,95 @@ io.on('connection', (socket) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// =========================
+// Telegram helper and endpoint
+// =========================
+async function sendTelegramMessage(text, chatIdOverride) {
+  const token = process.env.TELEGRAM_BOT_TOKEN || '';
+  const chatId = chatIdOverride || process.env.TELEGRAM_DEFAULT_CHAT_ID || '';
+  if (!token || !chatId) {
+    throw new Error('missing_telegram_token_or_chat_id');
+  }
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: String(text || '').slice(0, 4000), parse_mode: 'HTML', disable_web_page_preview: true })
+  });
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => String(resp.status));
+    throw new Error(`telegram_send_failed:${resp.status}:${t.slice(0,256)}`);
+  }
+  return await resp.json().catch(() => ({}));
+}
+
+// Protected by shared header secret (separate from JWT until FE auth integrates)
+app.post('/api/admin/telegram/send', async (req, res) => {
+  try {
+    const adminKeyHeader = String(req.headers['x-currex-admin-key'] || '');
+    const expected = process.env.CURREX_ADMIN_KEY || '';
+    if (!expected || adminKeyHeader !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const { text, chatId } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'text_required' });
+    await sendTelegramMessage(text, chatId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[telegram] send error', e);
+    res.status(500).json({ error: 'send_failed' });
+  }
+});
+
+// Telegram bot webhook removed from main backend to avoid conflicts. The
+// dedicated telegram-bot-server handles /api/telegram/* via Nginx routing.
+
+// =========================
+// Currex WebChat (lightweight website chat)
+// =========================
+app.post('/api/webchat/session', async (req, res) => {
+  try {
+    const sessionKey = String(req.body?.sessionKey || '').slice(0, 128);
+    const useKey = sessionKey || ('anon_' + Math.random().toString(36).slice(2));
+    let sess = await prisma.webChatSession.findUnique({ where: { sessionKey: useKey } }).catch(() => null);
+    if (!sess) {
+      sess = await prisma.webChatSession.create({ data: { sessionKey: useKey } });
+    }
+    res.json({ id: sess.id, sessionKey: useKey });
+  } catch (e) {
+    res.status(500).json({ error: 'session_failed' });
+  }
+});
+
+app.get('/api/webchat/messages', async (req, res) => {
+  try {
+    const sessionKey = String(req.query?.sessionKey || '').slice(0, 128);
+    if (!sessionKey) return res.status(400).json({ error: 'sessionKey_required' });
+    const since = req.query?.since ? new Date(String(req.query.since)) : null;
+    const sess = await prisma.webChatSession.findUnique({ where: { sessionKey } });
+    if (!sess) return res.json([]);
+    const where = { sessionId: sess.id };
+    const list = await prisma.webChatMessage.findMany({ where, orderBy: { timestamp: 'asc' } });
+    const filtered = since ? list.filter(m => new Date(m.timestamp) > since) : list;
+    res.json(filtered);
+  } catch (e) {
+    res.status(500).json({ error: 'fetch_failed' });
+  }
+});
+
+app.post('/api/webchat/messages', async (req, res) => {
+  try {
+    const { sessionKey, text } = req.body || {};
+    if (!sessionKey || !text) return res.status(400).json({ error: 'sessionKey_and_text_required' });
+    const sess = await prisma.webChatSession.findUnique({ where: { sessionKey } });
+    if (!sess) return res.status(404).json({ error: 'session_not_found' });
+    const msg = await prisma.webChatMessage.create({ data: { sessionId: sess.id, author: 'client', text: String(text).slice(0, 2000) } });
+    res.status(201).json(msg);
+  } catch (e) {
+    res.status(500).json({ error: 'send_failed' });
+  }
+});
 // Helper: convert News to DTO with imageIds
 async function newsToDTOWithImages(news) {
   const images = await prisma.newsImage.findMany({
@@ -1121,11 +1211,20 @@ function parseFxFromText(text) {
   };
   const buyT = parseTier(buyLine, false);
   const sellT = parseTier(sellLine, true);
-  return { sourceText, sellRate, buyRate, sellSamples: sellNums, buySamples: buyNums, allSamples: picks, parsedAt: new Date().toISOString(), buyAbove1mPer100k: buyT.above, buyBelow1mPer100k: buyT.below, sellAbove1mPer100k: sellT.above, sellBelow1mPer100k: sellT.below };
+  // Special 100-500 line e.g., "100-500အထက်-802/803"
+  let sellSpecial100to500 = null;
+  const specialMatch = sourceText.match(/100\s*[-–—]\s*500[^\n]*?(\d{3,4})\s*[\/\-]\s*(\d{3,4})/i);
+  if (specialMatch) sellSpecial100to500 = `${specialMatch[1]}/${specialMatch[2]}`;
+  // Payment method
+  const paymentMethod = /bank\s*transfer/i.test(sourceText) ? 'Bank Transfer' : (/kpay|wave/i.test(sourceText) ? 'Mobile Wallet' : undefined);
+  // Date text like 16-Oct-2025 or 16 Oct 2025
+  const dateTextMatch = sourceText.match(/\b(\d{1,2}[-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-\s]\d{4})\b/i);
+  const dateText = dateTextMatch ? dateTextMatch[1] : undefined;
+  return { sourceText, sellRate, buyRate, sellSamples: sellNums, buySamples: buyNums, allSamples: picks, parsedAt: new Date().toISOString(), buyAbove1mPer100k: buyT.above, buyBelow1mPer100k: buyT.below, sellAbove1mPer100k: sellT.above, sellBelow1mPer100k: sellT.below, sellSpecial100to500, paymentMethod, dateText };
 }
 
 // Create from text and store as ExchangeRate (admin/moderator)
-app.post('/api/admin/fx/parse', auth, requireModeratorOrAdmin, async (req, res) => {
+app.post('/api/admin/fx/parse', auth, requireAdmin, async (req, res) => {
   try {
     const { text, base = 'THB', quote = 'MMK' } = req.body || {};
     if (!(String(base).toUpperCase() === 'THB' && String(quote).toUpperCase() === 'MMK')) {
@@ -1133,7 +1232,7 @@ app.post('/api/admin/fx/parse', auth, requireModeratorOrAdmin, async (req, res) 
     }
     if (!text) return res.status(400).json({ error: 'text_required' });
     const parsed = parseFxFromText(text);
-    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById: req.user.id } });
+    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sellSpecial100to500: parsed.sellSpecial100to500 ?? null, paymentMethod: parsed.paymentMethod, dateText: parsed.dateText, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById: req.user.id } });
     res.status(201).json({ id: item.id, base: item.base, quote: item.quote, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt, createdAt: item.createdAt });
   } catch (e) {
     console.error('[fx/parse] error', e);
@@ -1142,7 +1241,7 @@ app.post('/api/admin/fx/parse', auth, requireModeratorOrAdmin, async (req, res) 
 });
 
 // List recent FX entries (admin)
-app.get('/api/admin/fx', auth, requireModeratorOrAdmin, async (req, res) => {
+app.get('/api/admin/fx', auth, requireAdmin, async (req, res) => {
   const list = await prisma.exchangeRate.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
   res.json(list);
 });
@@ -1191,6 +1290,7 @@ async function initializeAndStart() {
       }
       console.log('[startup] Seed complete.');
     }
+    // Telegram webhook is managed by the dedicated telegram-bot-server
     // Seed default news categories if none exist
     const newsCatCount = await prisma.newsCategory.count();
     if (newsCatCount === 0) {
@@ -1206,6 +1306,29 @@ async function initializeAndStart() {
         await prisma.news.update({ where: { id: allNews[i].id }, data: { categoryId: c.id } });
       }
       console.log('[startup] Seeded news categories and bound to existing news.');
+    }
+    // Ensure webchat tables exist even if migrations haven't run yet
+    try {
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS "WebChatSession" (
+          "id" TEXT PRIMARY KEY,
+          "sessionKey" TEXT NOT NULL UNIQUE,
+          "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          "lastActivityAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS "WebChatMessage" (
+          "id" TEXT PRIMARY KEY,
+          "sessionId" TEXT NOT NULL,
+          "author" TEXT NOT NULL,
+          "text" TEXT NOT NULL,
+          "timestamp" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          CONSTRAINT "WebChatMessage_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "WebChatSession"("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+      `);
+    } catch (e) {
+      console.warn('[startup] webchat tables ensure failed (will rely on migrations)', e?.message || e);
     }
   } catch (e) {
     console.error('[startup] Initialization error:', e);
