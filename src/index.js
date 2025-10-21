@@ -1223,16 +1223,38 @@ function parseFxFromText(text) {
   return { sourceText, sellRate, buyRate, sellSamples: sellNums, buySamples: buyNums, allSamples: picks, parsedAt: new Date().toISOString(), buyAbove1mPer100k: buyT.above, buyBelow1mPer100k: buyT.below, sellAbove1mPer100k: sellT.above, sellBelow1mPer100k: sellT.below, sellSpecial100to500, paymentMethod, dateText };
 }
 
-// Create from text and store as ExchangeRate (admin/moderator)
-app.post('/api/admin/fx/parse', auth, requireAdmin, async (req, res) => {
+// Create from text and store as ExchangeRate (admin/moderator or with admin key)
+app.post('/api/admin/fx/parse', async (req, res) => {
   try {
+    // Check admin key header first (for currency exchanger frontend)
+    const adminKeyHeader = String(req.headers['x-currex-admin-key'] || '');
+    const expected = process.env.CURREX_ADMIN_KEY || '';
+    const hasValidKey = expected && adminKeyHeader === expected;
+    
+    // If no valid key, check JWT auth
+    if (!hasValidKey) {
+      const hdr = req.headers.authorization || '';
+      const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+      try { 
+        const user = jwt.verify(token, JWT_SECRET);
+        if (!user || user.role !== 'ADMIN') {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+      } catch { 
+        return res.status(401).json({ error: 'Invalid token' }); 
+      }
+    }
+    
     const { text, base = 'THB', quote = 'MMK' } = req.body || {};
     if (!(String(base).toUpperCase() === 'THB' && String(quote).toUpperCase() === 'MMK')) {
       return res.status(400).json({ error: 'pair_not_allowed', allowed: 'THB/MMK' });
     }
     if (!text) return res.status(400).json({ error: 'text_required' });
     const parsed = parseFxFromText(text);
-    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sellSpecial100to500: parsed.sellSpecial100to500 ?? null, paymentMethod: parsed.paymentMethod, dateText: parsed.dateText, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById: req.user.id } });
+    // Use admin user ID (1) when using admin key, otherwise use authenticated user ID
+    const createdById = hasValidKey ? 1 : (req.user ? req.user.id : 1);
+    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sellSpecial100to500: parsed.sellSpecial100to500 ?? null, paymentMethod: parsed.paymentMethod, dateText: parsed.dateText, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById } });
     res.status(201).json({ id: item.id, base: item.base, quote: item.quote, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt, createdAt: item.createdAt });
   } catch (e) {
     console.error('[fx/parse] error', e);
@@ -1240,10 +1262,35 @@ app.post('/api/admin/fx/parse', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// List recent FX entries (admin)
-app.get('/api/admin/fx', auth, requireAdmin, async (req, res) => {
-  const list = await prisma.exchangeRate.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
-  res.json(list);
+// List recent FX entries (admin or with admin key)
+app.get('/api/admin/fx', async (req, res) => {
+  try {
+    // Check admin key header first
+    const adminKeyHeader = String(req.headers['x-currex-admin-key'] || '');
+    const expected = process.env.CURREX_ADMIN_KEY || '';
+    const hasValidKey = expected && adminKeyHeader === expected;
+    
+    // If no valid key, check JWT auth
+    if (!hasValidKey) {
+      const hdr = req.headers.authorization || '';
+      const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+      try { 
+        const user = jwt.verify(token, JWT_SECRET);
+        if (!user || user.role !== 'ADMIN') {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+      } catch { 
+        return res.status(401).json({ error: 'Invalid token' }); 
+      }
+    }
+    
+    const list = await prisma.exchangeRate.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
+    res.json(list);
+  } catch (e) {
+    console.error('[fx/list] error', e);
+    res.status(500).json({ error: 'fx_list_failed' });
+  }
 });
 
 // Public: latest FX for a pair
@@ -1252,7 +1299,24 @@ app.get('/api/fx/latest', async (req, res) => {
   const quote = 'MMK';
   const item = await prisma.exchangeRate.findFirst({ where: { base, quote }, orderBy: { createdAt: 'desc' } });
   if (!item) return res.status(404).json({ error: 'not_found' });
-  res.json({ base, quote, updatedAt: item.createdAt, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt });
+  // Return full data for frontend compatibility
+  res.json({
+    id: item.id,
+    base: item.base,
+    quote: item.quote,
+    buyRate: item.buyRate,
+    sellRate: item.sellRate,
+    buyBelow1mPer100k: item.buyBelow1mPer100k,
+    buyAbove1mPer100k: item.buyAbove1mPer100k,
+    sellBelow1mPer100k: item.sellBelow1mPer100k,
+    sellAbove1mPer100k: item.sellAbove1mPer100k,
+    sellSpecial100to500: item.sellSpecial100to500,
+    paymentMethod: item.paymentMethod,
+    dateText: item.dateText,
+    sourceText: item.sourceText,
+    createdAt: item.createdAt,
+    parsedAt: item.parsedAt
+  });
 });
 
 async function initializeAndStart() {
