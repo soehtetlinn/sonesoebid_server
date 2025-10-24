@@ -49,6 +49,84 @@ io.on('connection', (socket) => {
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // =========================
+// Currex Admin Authentication
+// =========================
+app.post('/api/currex/admin/login', async (req, res) => {
+  try {
+    const { password } = req.body || {};
+    const expectedPassword = process.env.CURREX_ADMIN_PASSWORD;
+    
+    if (!password || password !== expectedPassword) {
+      return res.status(401).json({ error: 'Invalid admin password' });
+    }
+    
+    // Generate a simple admin session token (in production, use proper JWT)
+    const adminToken = Buffer.from(`currex_admin_${Date.now()}_${Math.random().toString(36).slice(2)}`).toString('base64');
+    
+    res.json({ 
+      success: true, 
+      token: adminToken,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 hours
+    });
+  } catch (e) {
+    console.error('[currex-admin-login] error', e);
+    res.status(500).json({ error: 'login_failed' });
+  }
+});
+
+app.post('/api/currex/admin/verify', async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (!token) {
+      return res.status(401).json({ valid: false });
+    }
+    
+    // Simple token validation (in production, use proper JWT verification)
+    const isValid = token.startsWith('currex_admin_');
+    res.json({ valid: isValid });
+  } catch (e) {
+    res.status(500).json({ valid: false });
+  }
+});
+
+// Structured rate submission endpoint
+app.post('/api/currex/admin/rates', async (req, res) => {
+  try {
+    const { date, paymentMethod, sellingRates, buyingRates, notes } = req.body || {};
+    
+    if (!sellingRates?.below1M_MMK || !sellingRates?.above1M_MMK || !buyingRates?.base) {
+      return res.status(400).json({ error: 'Missing required rate fields' });
+    }
+
+    // Create structured source text for consistency
+    const sourceText = `${date}\n\n${paymentMethod}\n\nSelling (အရောင်း)\nမြန်မာငွေ10သိန်းအထက် ${sellingRates.above1M_MMK}\n\nမြန်မာငွေ10သိန်းအောက် ${sellingRates.below1M_MMK}\n\nBuying (အဝယ်) ${buyingRates.base}${buyingRates.above1M_MMK ? `\n\n10သိန်းအထက်${buyingRates.above1M_MMK}` : ''}${notes?.length ? `\n\n${notes.join('\n')}` : ''}`;
+
+    const rateData = {
+      base: 'THB',
+      quote: 'MMK',
+      sourceText,
+      sellRate: sellingRates.below1M_MMK,
+      buyRate: buyingRates.base,
+      sellBelow1mPer100k: sellingRates.below1M_MMK,
+      sellAbove1mPer100k: sellingRates.above1M_MMK,
+      buyBelow1mPer100k: buyingRates.base,
+      buyAbove1mPer100k: buyingRates.above1M_MMK || null,
+      sellSpecial100to500: null,
+      paymentMethod,
+      dateText: date,
+      notes: notes || [],
+      createdById: 1
+    };
+
+    const saved = await prisma.exchangeRate.create({ data: rateData });
+    res.json({ success: true, id: saved.id });
+  } catch (e) {
+    console.error('[currex-admin-rates] error', e);
+    res.status(500).json({ error: 'Failed to save rates' });
+  }
+});
+
+// =========================
 // Telegram helper and endpoint
 // =========================
 async function sendTelegramMessage(text, chatIdOverride) {
@@ -1158,69 +1236,73 @@ app.patch('/api/admin/news/:id/videos/reorder', auth, requireModeratorOrAdmin, a
 
 function parseFxFromText(text) {
   const sourceText = String(text || '');
-  const normalized = sourceText.replace(/[,\s]+/g, ' ').replace(/[၊\-–—]+/g, ' ').toLowerCase();
-  // Extract numbers that look like rates (3-4 digits)
-  const numberRegex = /(\d{2,3,4})(?:\/(\d{2,3,4}))?/g;
-  const picks = [];
-  let m;
-  while ((m = numberRegex.exec(sourceText)) !== null) {
-    const a = parseInt(m[1], 10);
-    const b = m[2] ? parseInt(m[2], 10) : null;
-    if (!isNaN(a)) picks.push(a);
-    if (b && !isNaN(b)) picks.push(b);
-  }
-  // Heuristics: detect selling and buying blocks
-  const sellBlockMatch = sourceText.match(/Selling[^\n]*([\s\S]*?)(?:Buying|$)/i);
-  const buyBlockMatch = sourceText.match(/Buying[^\n]*([\s\S]*?)(?:$)/i);
-  const extractNums = (block) => {
-    if (!block) return [];
-    const arr = [];
-    let mm;
-    const r = /(\d{3,4})(?:[\/\-](\d{3,4}))?/g;
-    while ((mm = r.exec(block)) !== null) {
-      const x = parseInt(mm[1], 10);
-      const y = mm[2] ? parseInt(mm[2], 10) : null;
-      if (!isNaN(x)) arr.push(x);
-      if (y && !isNaN(y)) arr.push(y);
-    }
-    return arr;
+  // Identify Selling and Buying blocks
+  const sellingBlock = sourceText.match(/Selling[\s\S]*?(?=Buying|$)/i)?.[0] || '';
+  const buyingBlock = sourceText.match(/Buying[\s\S]*?$/i)?.[0] || '';
+
+  const pickFirstNumber = (s) => {
+    const m = s.match(/(\d{3,4})(?:\/(\d{3,4}))?/);
+    return m ? parseInt(m[1], 10) : null;
   };
-  const sellNums = extractNums(sellBlockMatch ? sellBlockMatch[1] : null);
-  const buyNums = extractNums(buyBlockMatch ? buyBlockMatch[1] : null);
-  const avg = (arr) => arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length) : null;
-  const sellRate = sellNums.length ? avg(sellNums) : (picks.length ? avg(picks) : null);
-  const buyRate = buyNums.length ? avg(buyNums) : (picks.length ? avg(picks) : null);
-  // Tiered extraction heuristics for 1,000,000 MMK threshold, per 100,000 MMK terms
-  const mmkAboveRegex = /(10\s*[သစ]ိန္႔|၁၀\s*သိန္း).*?(\d{3,4})(?:[\/\-](\d{3,4}))?/i; // above 1M
-  const mmkBelowRegex = /(10\s*[သစ]ိန္႔|၁၀\s*သိန္း).*?အောက်.*?(\d{3,4})/i; // below 1M
-  const buyLine = /Buying|အဝယ်/i.test(sourceText) ? (buyBlockMatch ? buyBlockMatch[1] : sourceText) : sourceText;
-  const sellLine = /Selling|အရောင်း/i.test(sourceText) ? (sellBlockMatch ? sellBlockMatch[1] : sourceText) : sourceText;
-  const parseTier = (s, isSell) => {
-    let above = null, below = null;
-    const a = mmkAboveRegex.exec(s);
-    if (a) {
-      const x = parseInt(a[3] || a[2], 10);
-      if (!isNaN(x)) above = x;
-    }
-    const b = mmkBelowRegex.exec(s);
-    if (b) {
-      const y = parseInt(b[2], 10);
-      if (!isNaN(y)) below = y;
-    }
-    return { above, below };
-  };
-  const buyT = parseTier(buyLine, false);
-  const sellT = parseTier(sellLine, true);
-  // Special 100-500 line e.g., "100-500အထက်-802/803"
-  let sellSpecial100to500 = null;
-  const specialMatch = sourceText.match(/100\s*[-–—]\s*500[^\n]*?(\d{3,4})\s*[\/\-]\s*(\d{3,4})/i);
-  if (specialMatch) sellSpecial100to500 = `${specialMatch[1]}/${specialMatch[2]}`;
+
+  // Selling tiers (anchor on 10 သိန်း to avoid matching special 100-500 line)
+  const sellAboveMatch = sellingBlock.match(/(10\s*သိန်း|၁၀\s*သိန်း)[^\n]*?အထက်[^\d]*(\d{3,4})(?:[\/\-](\d{3,4}))?/);
+  const sellBelowMatch = sellingBlock.match(/(10\s*သိန်း|၁၀\s*သိန်း)[^\n]*?အောက်[^\d]*(\d{3,4})/);
+  const sellAbove1m = sellAboveMatch ? parseInt((sellAboveMatch[3] || sellAboveMatch[2]), 10) : null;
+  const sellBelow1m = sellBelowMatch ? parseInt(sellBelowMatch[2], 10) : null;
+
+  // Buying tiers
+  // Base is the first number on the Buying line
+  const buyBase = pickFirstNumber(buyingBlock);
+  // Above 1M on the line mentioning 10 သိန်း and 'အထက်'
+  const buyAboveMatch = buyingBlock.match(/(10\s*သိန်း|၁၀\s*သိန်း)[^\n]*?အထက်[^\d]*(\d{3,4})(?:[\/\-](\d{3,4}))?/);
+  const buyAbove1m = buyAboveMatch ? parseInt((buyAboveMatch[3] || buyAboveMatch[2]), 10) : null;
+
+  // Special line e.g., 100-500အထက်-809/810
+  const specialMatch = sourceText.match(/100\s*[-–—]\s*500[^\n]*?(\d{3,4})\s*[\/-]\s*(\d{3,4})/i);
+  const sellSpecial100to500 = specialMatch ? `${specialMatch[1]}/${specialMatch[2]}` : null;
+  const specialHigh = specialMatch ? Math.max(parseInt(specialMatch[1], 10), parseInt(specialMatch[2], 10)) : null;
+
   // Payment method
   const paymentMethod = /bank\s*transfer/i.test(sourceText) ? 'Bank Transfer' : (/kpay|wave/i.test(sourceText) ? 'Mobile Wallet' : undefined);
-  // Date text like 16-Oct-2025 or 16 Oct 2025
-  const dateTextMatch = sourceText.match(/\b(\d{1,2}[-\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-\s]\d{4})\b/i);
+  // Date text like 19-Oct-2025 or 19 Oct 2025
+  const dateTextMatch = sourceText.match(/\b(\d{1,2}[-\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\s]\d{4})\b/i);
   const dateText = dateTextMatch ? dateTextMatch[1] : undefined;
-  return { sourceText, sellRate, buyRate, sellSamples: sellNums, buySamples: buyNums, allSamples: picks, parsedAt: new Date().toISOString(), buyAbove1mPer100k: buyT.above, buyBelow1mPer100k: buyT.below, sellAbove1mPer100k: sellT.above, sellBelow1mPer100k: sellT.below, sellSpecial100to500, paymentMethod, dateText };
+
+  // Fallbacks: if tiered not found, use first numbers in each block
+  const sellSamples = [];
+  const buySamples = [];
+  sellingBlock.replace(/(\d{3,4})/g, (_, n) => { const x = parseInt(n, 10); if (!isNaN(x)) sellSamples.push(x); return ''; });
+  buyingBlock.replace(/(\d{3,4})/g, (_, n) => { const x = parseInt(n, 10); if (!isNaN(x)) buySamples.push(x); return ''; });
+  const sellRateFallback = sellSamples.length ? sellSamples[0] : null;
+  const buyRateFallback = buySamples.length ? buySamples[0] : null;
+
+  // Business rule (per user spec):
+  // - Selling <1M uses the higher of the two tier lines (often the "အထက်" value)
+  // - Selling >1M uses the higher between the explicit >1M line and the special range high (e.g., 809/810 -> 810)
+  const finalSellBelow1m = (Math.max(sellBelow1m || 0, sellAbove1m || 0) || sellBelow1m || sellAbove1m || sellRateFallback);
+  const finalSellAbove1m = (Math.max(sellAbove1m || 0, specialHigh || 0) || sellAbove1m || specialHigh || sellRateFallback);
+
+  // Ensure primary sellRate/buyRate align with tiered/base values
+  const finalSellRate = finalSellBelow1m ?? sellRateFallback;
+  const finalBuyRate = (buyBase ?? buyAbove1m ?? buyRateFallback);
+
+  return {
+    sourceText,
+    sellRate: finalSellRate,
+    buyRate: finalBuyRate,
+    sellSamples,
+    buySamples,
+    allSamples: [...sellSamples, ...buySamples],
+    parsedAt: new Date().toISOString(),
+    buyAbove1mPer100k: buyAbove1m ?? finalBuyRate ?? null,
+    buyBelow1mPer100k: buyBase ?? finalBuyRate ?? null,
+    sellAbove1mPer100k: finalSellAbove1m ?? finalSellRate ?? null,
+    sellBelow1mPer100k: finalSellBelow1m ?? finalSellRate ?? null,
+    sellSpecial100to500,
+    paymentMethod,
+    dateText,
+  };
 }
 
 // Create from text and store as ExchangeRate (admin/moderator or with admin key)
@@ -1252,9 +1334,40 @@ app.post('/api/admin/fx/parse', async (req, res) => {
     }
     if (!text) return res.status(400).json({ error: 'text_required' });
     const parsed = parseFxFromText(text);
+
+    // Normalize: enforce tiers and primary rates deterministically
+    const normSellBelow = parsed.sellBelow1mPer100k ?? parsed.sellRate ?? null;
+    const normSellAbove = parsed.sellAbove1mPer100k ?? parsed.sellRate ?? null;
+    const normBuyBase = parsed.buyBelow1mPer100k ?? parsed.buyRate ?? null;
+    const normBuyAbove = parsed.buyAbove1mPer100k ?? parsed.buyRate ?? null;
+
+    const normalized = {
+      sellBelow1mPer100k: normSellBelow,
+      sellAbove1mPer100k: normSellAbove,
+      buyBelow1mPer100k: normBuyBase,
+      buyAbove1mPer100k: normBuyAbove,
+      sellRate: normSellBelow, // store <1M as primary sellRate
+      buyRate: normBuyBase,    // store base as primary buyRate
+    };
+
     // Use admin user ID (1) when using admin key, otherwise use authenticated user ID
     const createdById = hasValidKey ? 1 : (req.user ? req.user.id : 1);
-    const item = await prisma.exchangeRate.create({ data: { base, quote, buyRate: parsed.buyRate ?? null, sellRate: parsed.sellRate ?? null, buyBelow1mPer100k: parsed.buyBelow1mPer100k ?? null, buyAbove1mPer100k: parsed.buyAbove1mPer100k ?? null, sellBelow1mPer100k: parsed.sellBelow1mPer100k ?? null, sellAbove1mPer100k: parsed.sellAbove1mPer100k ?? null, sellSpecial100to500: parsed.sellSpecial100to500 ?? null, paymentMethod: parsed.paymentMethod, dateText: parsed.dateText, sourceText: parsed.sourceText, sellSamples: parsed.sellSamples, buySamples: parsed.buySamples, allSamples: parsed.allSamples, parsedAt: new Date(parsed.parsedAt), createdById } });
+    const item = await prisma.exchangeRate.create({ data: { base, quote,
+      buyRate: normalized.buyRate,
+      sellRate: normalized.sellRate,
+      buyBelow1mPer100k: normalized.buyBelow1mPer100k,
+      buyAbove1mPer100k: normalized.buyAbove1mPer100k,
+      sellBelow1mPer100k: normalized.sellBelow1mPer100k,
+      sellAbove1mPer100k: normalized.sellAbove1mPer100k,
+      sellSpecial100to500: parsed.sellSpecial100to500 ?? null,
+      paymentMethod: parsed.paymentMethod,
+      dateText: parsed.dateText,
+      sourceText: parsed.sourceText,
+      sellSamples: parsed.sellSamples,
+      buySamples: parsed.buySamples,
+      allSamples: parsed.allSamples,
+      parsedAt: new Date(parsed.parsedAt),
+      createdById } });
     res.status(201).json({ id: item.id, base: item.base, quote: item.quote, buyRate: item.buyRate, sellRate: item.sellRate, parsedAt: item.parsedAt, createdAt: item.createdAt });
   } catch (e) {
     console.error('[fx/parse] error', e);
@@ -1286,7 +1399,29 @@ app.get('/api/admin/fx', async (req, res) => {
     }
     
     const list = await prisma.exchangeRate.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
-    res.json(list);
+    // Re-parse any rows missing tiered fields
+    const healed = await Promise.all(list.map(async (item) => {
+      if (item.sellBelow1mPer100k && item.sellAbove1mPer100k && item.buyBelow1mPer100k && item.buyAbove1mPer100k) return item;
+      try {
+        const re = parseFxFromText(item.sourceText);
+        const data = {
+          buyRate: re.buyRate ?? item.buyRate,
+          sellRate: re.sellRate ?? item.sellRate,
+          buyBelow1mPer100k: re.buyBelow1mPer100k ?? item.buyBelow1mPer100k,
+          buyAbove1mPer100k: re.buyAbove1mPer100k ?? item.buyAbove1mPer100k,
+          sellBelow1mPer100k: re.sellBelow1mPer100k ?? item.sellBelow1mPer100k,
+          sellAbove1mPer100k: re.sellAbove1mPer100k ?? item.sellAbove1mPer100k,
+          sellSpecial100to500: re.sellSpecial100to500 ?? item.sellSpecial100to500,
+          paymentMethod: re.paymentMethod ?? item.paymentMethod,
+          dateText: re.dateText ?? item.dateText,
+        };
+        await prisma.exchangeRate.update({ where: { id: item.id }, data });
+        return { ...item, ...data };
+      } catch {
+        return item;
+      }
+    }));
+    res.json(healed);
   } catch (e) {
     console.error('[fx/list] error', e);
     res.status(500).json({ error: 'fx_list_failed' });
@@ -1299,23 +1434,45 @@ app.get('/api/fx/latest', async (req, res) => {
   const quote = 'MMK';
   const item = await prisma.exchangeRate.findFirst({ where: { base, quote }, orderBy: { createdAt: 'desc' } });
   if (!item) return res.status(404).json({ error: 'not_found' });
-  // Return full data for frontend compatibility
+  // Heal records missing tiered fields by re-parsing sourceText
+  let patched = { ...item };
+  if (!item.sellBelow1mPer100k || !item.sellAbove1mPer100k || !item.buyBelow1mPer100k || !item.buyAbove1mPer100k) {
+    try {
+      const re = parseFxFromText(item.sourceText);
+      const data = {
+        buyRate: re.buyRate ?? item.buyRate,
+        sellRate: re.sellRate ?? item.sellRate,
+        buyBelow1mPer100k: re.buyBelow1mPer100k ?? item.buyBelow1mPer100k,
+        buyAbove1mPer100k: re.buyAbove1mPer100k ?? item.buyAbove1mPer100k,
+        sellBelow1mPer100k: re.sellBelow1mPer100k ?? item.sellBelow1mPer100k,
+        sellAbove1mPer100k: re.sellAbove1mPer100k ?? item.sellAbove1mPer100k,
+        sellSpecial100to500: re.sellSpecial100to500 ?? item.sellSpecial100to500,
+        paymentMethod: re.paymentMethod ?? item.paymentMethod,
+        dateText: re.dateText ?? item.dateText,
+      };
+      patched = { ...patched, ...data };
+      // Persist correction to DB (best-effort)
+      await prisma.exchangeRate.update({ where: { id: item.id }, data });
+    } catch (e) {
+      console.warn('[fx/latest] reparse failed, returning stored values');
+    }
+  }
   res.json({
-    id: item.id,
-    base: item.base,
-    quote: item.quote,
-    buyRate: item.buyRate,
-    sellRate: item.sellRate,
-    buyBelow1mPer100k: item.buyBelow1mPer100k,
-    buyAbove1mPer100k: item.buyAbove1mPer100k,
-    sellBelow1mPer100k: item.sellBelow1mPer100k,
-    sellAbove1mPer100k: item.sellAbove1mPer100k,
-    sellSpecial100to500: item.sellSpecial100to500,
-    paymentMethod: item.paymentMethod,
-    dateText: item.dateText,
-    sourceText: item.sourceText,
-    createdAt: item.createdAt,
-    parsedAt: item.parsedAt
+    id: patched.id,
+    base: patched.base,
+    quote: patched.quote,
+    buyRate: patched.buyRate,
+    sellRate: patched.sellRate,
+    buyBelow1mPer100k: patched.buyBelow1mPer100k,
+    buyAbove1mPer100k: patched.buyAbove1mPer100k,
+    sellBelow1mPer100k: patched.sellBelow1mPer100k,
+    sellAbove1mPer100k: patched.sellAbove1mPer100k,
+    sellSpecial100to500: patched.sellSpecial100to500,
+    paymentMethod: patched.paymentMethod,
+    dateText: patched.dateText,
+    sourceText: patched.sourceText,
+    createdAt: patched.createdAt,
+    parsedAt: patched.parsedAt
   });
 });
 
