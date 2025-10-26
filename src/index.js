@@ -12,8 +12,14 @@ import { Server as SocketIOServer } from 'socket.io';
 import bcrypt from 'bcryptjs';
 import { exec as _exec } from 'child_process';
 import util from 'util';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const exec = util.promisify(_exec);
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
@@ -1560,6 +1566,19 @@ async function initializeAndStart() {
     });
   }
 }
+
+// Serve static files from the frontend build directory
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// Catch-all handler: send back React's index.html file for any non-API routes
+app.get('*', (req, res) => {
+  // Only serve index.html for non-API routes
+  if (!req.path.startsWith('/api/')) {
+    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
+  }
+});
 
 initializeAndStart();
 
