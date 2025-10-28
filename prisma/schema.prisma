@@ -22,6 +22,33 @@ enum DisputeStatus {
   RESOLVED
 }
 
+enum QrCodeType {
+  STATIC
+  DYNAMIC
+}
+
+enum QrCodeStatus {
+  ACTIVE
+  INACTIVE
+  EXPIRED
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  PENDING
+  PAUSED
+}
+
+enum BillingInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
 model User {
   id              Int            @id @default(autoincrement())
   username        String         @unique
@@ -43,11 +70,16 @@ model User {
   newsAuthored    News[]
   roleAssignments UserRoleAssignment[]
   exchangeRates   ExchangeRate[]
+  dynamicQrCodes  DynamicQrCode[]
+  subscriptions   UserSubscription[]
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   Watchlist       Watchlist[]
   CartItem        CartItem[]
   Dispute         Dispute[]
+  // Dropshipping relations
+  dropshipOrders  DropshipOrder[]
+  dropshipCartItems DropshipCartItem[]
 }
 
 model Product {
@@ -327,4 +359,310 @@ model WebChatMessage {
   author     String          // 'client' | 'admin'
   text       String
   timestamp  DateTime        @default(now())
+}
+
+// Dynamic QR Code Models
+
+model DynamicQrCode {
+  id                String        @id @default(cuid())
+  user              User          @relation(fields: [userId], references: [id])
+  userId            Int
+  shortCode         String        @unique
+  shortUrl          String        @unique
+  destinationUrl    String
+  title             String?
+  description       String?
+  type              QrCodeType    @default(DYNAMIC)
+  status            QrCodeStatus  @default(ACTIVE)
+  scanCount         Int           @default(0)
+  lastScannedAt     DateTime?
+  expiresAt         DateTime?
+  isTrial           Boolean       @default(true)
+  trialEndsAt       DateTime?
+  metadata          Json?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  scans             QrCodeScan[]
+  
+  @@map("dynamic_qr_codes")
+}
+
+model QrCodeScan {
+  id                String        @id @default(cuid())
+  qrCode            DynamicQrCode @relation(fields: [qrCodeId], references: [id])
+  qrCodeId          String
+  ipAddress         String?
+  userAgent         String?
+  country           String?
+  city              String?
+  device            String?
+  browser           String?
+  os                String?
+  referrer          String?
+  scannedAt         DateTime      @default(now())
+  
+  @@map("qr_code_scans")
+}
+
+// Subscription Models
+
+model SubscriptionPlan {
+  id              String              @id @default(cuid())
+  name            String              @unique
+  description     String?
+  price           Float
+  billingInterval BillingInterval     @default(MONTHLY)
+  features        Json?
+  maxQrCodes      Int?
+  maxScansPerMonth Int?
+  isActive        Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  subscriptions   UserSubscription[]
+  
+  @@map("subscription_plans")
+}
+
+model UserSubscription {
+  id              String              @id @default(cuid())
+  user            User                @relation(fields: [userId], references: [id])
+  userId          Int
+  plan            SubscriptionPlan    @relation(fields: [planId], references: [id])
+  planId          String
+  status          SubscriptionStatus  @default(PENDING)
+  startDate       DateTime            @default(now())
+  endDate         DateTime?
+  nextBillingDate DateTime?
+  cancelledAt     DateTime?
+  trialEndsAt     DateTime?
+  autoRenew       Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  
+  @@map("user_subscriptions")
+}
+
+// =============================================
+// DROPSHIPPING MODELS
+// =============================================
+
+enum DropshipSupplierType {
+  ALIEXPRESS
+  CJ_DROPSHIPPING
+  SPOCKET
+  OBERLO
+  CUSTOM
+}
+
+enum DropshipOrderStatus {
+  PENDING           // Customer paid, waiting to send to supplier
+  PROCESSING        // Order sent to supplier
+  CONFIRMED         // Supplier confirmed order
+  SHIPPED           // Supplier shipped order
+  IN_TRANSIT        // Package in transit
+  DELIVERED         // Customer received
+  CANCELLED         // Order cancelled
+  REFUNDED          // Order refunded
+  FAILED            // Failed to process
+}
+
+enum DropshipProductStatus {
+  ACTIVE
+  INACTIVE
+  OUT_OF_STOCK
+  DISCONTINUED
+}
+
+/// Dropshipping suppliers
+model DropshipSupplier {
+  id              String                @id @default(cuid())
+  name            String                @unique
+  type            DropshipSupplierType
+  apiKey          String?               // Encrypted API key
+  apiSecret       String?               // Encrypted API secret
+  websiteUrl      String?
+  contactEmail    String?
+  contactPhone    String?
+  notes           String?
+  isActive        Boolean               @default(true)
+  avgShippingDays Int?                  // Average shipping time in days
+  rating          Float?                // Supplier rating (0-5)
+  products        DropshipProduct[]
+  orders          DropshipOrder[]
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+  
+  @@map("dropship_suppliers")
+}
+
+/// Dropshipping products (separate from auction products)
+model DropshipProduct {
+  id                  String                @id @default(cuid())
+  title               String
+  description         String                @db.Text
+  shortDescription    String?
+  images              String[]              // Array of image URLs
+  category            String
+  tags                String[]
+  
+  // Supplier info
+  supplier            DropshipSupplier      @relation(fields: [supplierId], references: [id])
+  supplierId          String
+  supplierProductId   String                // Product ID on supplier's platform
+  supplierUrl         String?               // Link to product on supplier site
+  supplierSku         String?
+  
+  // Pricing
+  supplierCost        Float                 // What you pay supplier
+  sellingPrice        Float                 // What customer pays you
+  compareAtPrice      Float?                // Original/compare price for display
+  profitMargin        Float                 // Calculated profit margin percentage
+  profitAmount        Float                 // Calculated profit amount
+  
+  // Inventory
+  stockQuantity       Int                   @default(0)
+  lowStockThreshold   Int                   @default(10)
+  status              DropshipProductStatus @default(ACTIVE)
+  
+  // Shipping
+  shippingCost        Float                 @default(0)
+  estimatedShippingDays String?             // e.g. "7-15 days"
+  weight              Float?                // In kg
+  dimensions          Json?                 // { length, width, height }
+  
+  // SEO & Marketing
+  slug                String                @unique
+  metaTitle           String?
+  metaDescription     String?
+  
+  // Stats
+  viewCount           Int                   @default(0)
+  orderCount          Int                   @default(0)
+  lastSyncedAt        DateTime?             // Last time we synced with supplier
+  
+  // Relations
+  orders              DropshipOrder[]
+  cartItems           DropshipCartItem[]
+  
+  isActive            Boolean               @default(true)
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+  
+  @@index([category])
+  @@index([status])
+  @@index([supplierId])
+  @@map("dropship_products")
+}
+
+/// Dropshipping orders (separate from auction orders)
+model DropshipOrder {
+  id                    String               @id @default(cuid())
+  orderNumber           String               @unique // e.g. "DS-20250128-0001"
+  
+  // Customer info
+  customer              User                 @relation(fields: [customerId], references: [id])
+  customerId            Int
+  customerEmail         String
+  customerPhone         String?
+  
+  // Product info
+  product               DropshipProduct      @relation(fields: [productId], references: [id])
+  productId             String
+  productTitle          String               // Snapshot at time of order
+  productImage          String?              // Main product image
+  quantity              Int                  @default(1)
+  
+  // Supplier info
+  supplier              DropshipSupplier     @relation(fields: [supplierId], references: [id])
+  supplierId            String
+  supplierOrderId       String?              // Order ID from supplier's system
+  supplierOrderNumber   String?
+  
+  // Shipping address
+  shippingFirstName     String
+  shippingLastName      String
+  shippingAddress1      String
+  shippingAddress2      String?
+  shippingCity          String
+  shippingState         String?
+  shippingZip           String?
+  shippingCountry       String
+  shippingPhone         String
+  
+  // Pricing breakdown
+  productPrice          Float                // What customer paid for product
+  shippingFee           Float                @default(0)
+  tax                   Float                @default(0)
+  discount              Float                @default(0)
+  totalPaid             Float                // Total customer paid
+  supplierCost          Float                // What we paid supplier
+  profit                Float                // Our profit
+  
+  // Payment
+  paymentMethod         String?              // e.g. "KBZ Pay", "Wave Money", "PayPal"
+  paymentStatus         String               @default("paid")
+  paymentTransactionId  String?
+  
+  // Order status
+  status                DropshipOrderStatus  @default(PENDING)
+  statusHistory         Json[]               @default([]) // Track status changes
+  
+  // Tracking
+  trackingNumber        String?
+  trackingUrl           String?
+  trackingCarrier       String?
+  shippedAt             DateTime?
+  estimatedDeliveryDate DateTime?
+  deliveredAt           DateTime?
+  
+  // Communication
+  notes                 String?              // Internal notes
+  customerNotes         String?              // Notes from customer
+  
+  // Flags
+  isAutomated           Boolean              @default(true) // Was it auto-sent to supplier?
+  requiresAttention     Boolean              @default(false) // Flag for manual review
+  
+  // Timestamps
+  orderDate             DateTime             @default(now())
+  processedAt           DateTime?            // When sent to supplier
+  cancelledAt           DateTime?
+  refundedAt            DateTime?
+  
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+  
+  @@index([customerId])
+  @@index([status])
+  @@index([orderDate])
+  @@map("dropship_orders")
+}
+
+/// Shopping cart for dropshipping products
+model DropshipCartItem {
+  id          Int             @id @default(autoincrement())
+  user        User            @relation(fields: [userId], references: [id])
+  userId      Int
+  product     DropshipProduct @relation(fields: [productId], references: [id])
+  productId   String
+  quantity    Int             @default(1)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  
+  @@unique([userId, productId])
+  @@map("dropship_cart_items")
+}
+
+/// Product import history (track bulk imports)
+model DropshipImportLog {
+  id              String   @id @default(cuid())
+  supplier        String
+  totalProducts   Int
+  successCount    Int
+  failedCount     Int
+  errors          Json?
+  importedBy      Int      // User ID who initiated import
+  createdAt       DateTime @default(now())
+  
+  @@map("dropship_import_logs")
 }

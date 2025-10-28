@@ -13,6 +13,7 @@ async function upsertUser({ username, email, password, role, firstName, lastName
       lastName: lastName ?? null,
       role: role ?? 'BUYER',
       password: hashed,
+      updatedAt: new Date(),
     },
     create: {
       username,
@@ -21,6 +22,7 @@ async function upsertUser({ username, email, password, role, firstName, lastName
       role: role ?? 'BUYER',
       firstName: firstName ?? null,
       lastName: lastName ?? null,
+      updatedAt: new Date(),
     },
   });
   return user;

@@ -1,7 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import express from 'express';
-import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
@@ -14,6 +13,8 @@ import { exec as _exec } from 'child_process';
 import util from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
+import dropshippingRoutes from './routes/dropshipping.routes.js';
 
 const exec = util.promisify(_exec);
 
@@ -24,10 +25,27 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const server = http.createServer(app);
 
-// CORS allowlist (comma-separated in env) with sensible default
-const allowedOrigins = (process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : ['https://www.shltechent.com']);
-
-const io = new SocketIOServer(server, { cors: { origin: allowedOrigins, methods: ['GET','POST'] } });
+const io = new SocketIOServer(server, { 
+  cors: { 
+    origin: [
+      'https://www.shltechent.com',
+      'https://shltechent.com',
+      'https://api.shltechent.com',
+      'https://qr-suite.shltechent.com',
+      'https://qr.shltechent.com',
+      'https://currex.shltechent.com',
+      'https://dashboard.shltechent.com',
+      'https://sanpyashaesaung.shltechent.com',
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://localhost:3002',
+      'http://localhost:5173',
+      'http://localhost:5174'
+    ], 
+    methods: ['GET','POST'],
+    credentials: true
+  } 
+});
 const prisma = new PrismaClient();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 5 } });
 
@@ -37,15 +55,44 @@ app.set('trust proxy', 1);
 // Security headers (keep CSP off for now to avoid breaking inline scripts/importmap)
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// Restrictive CORS
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true); // allow same-origin/no-origin (curl, mobile apps)
-    return allowedOrigins.includes(origin) ? callback(null, true) : callback(new Error('Not allowed by CORS'));
-  },
-  methods: ['GET','POST','PATCH','DELETE'],
-  credentials: true,
-}));
+// CORS configuration
+const allowedOrigins = (process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean) : [
+  'https://www.shltechent.com',
+  'https://shltechent.com',
+  'https://api.shltechent.com',
+  'https://qr-suite.shltechent.com',
+  'https://qr.shltechent.com',
+  'https://currex.shltechent.com',
+  'https://dashboard.shltechent.com',
+  'https://sanpyashaesaung.shltechent.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:4000',
+  'http://localhost:5173',
+  'http://localhost:5174'
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Only set header if origin is allowed
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
+
 app.use(express.json());
 io.on('connection', (socket) => {
   socket.on('joinConvo', (convoId) => socket.join(`convo:${convoId}`));
@@ -251,12 +298,40 @@ async function newsToDTOWithImages(news) {
 
 // Auth utils
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme-dev';
-function signToken(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' }); }
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'refresh-secret-dev';
+
+function signToken(payload) { 
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' }); 
+}
+
+function signRefreshToken(payload) { 
+  return jwt.sign(payload, JWT_REFRESH_SECRET, { expiresIn: '7d' }); 
+}
+
 function auth(req, res, next) {
   const hdr = req.headers.authorization || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  try { 
+    req.user = jwt.verify(token, JWT_SECRET); 
+    next(); 
+  } catch { 
+    return res.status(401).json({ error: 'Invalid token' }); 
+  }
+}
+
+// Optional auth - doesn't fail if no token
+function optionalAuth(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  if (token) {
+    try { 
+      req.user = jwt.verify(token, JWT_SECRET); 
+    } catch { 
+      // Ignore invalid tokens for optional auth
+    }
+  }
+  next();
 }
 
 // Helper function to get user roles (primary + assigned roles)
@@ -326,6 +401,11 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHead
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 
+// =============================================
+// DROPSHIPPING ROUTES
+// =============================================
+app.use('/api/dropship', optionalAuth, dropshippingRoutes);
+
 // Login with email/username and password
 app.post('/api/login', async (req, res) => {
   try {
@@ -370,8 +450,8 @@ app.post('/api/login', async (req, res) => {
     // Get all user roles (primary + assigned)
     const userRoles = await getUserRoles(user.id);
     
-    // Generate JWT token
-    const token = signToken({ 
+    // Generate JWT tokens
+    const accessToken = signToken({ 
       id: user.id, 
       email: user.email, 
       username: user.username,
@@ -379,12 +459,67 @@ app.post('/api/login', async (req, res) => {
       roles: userRoles // All roles
     });
     
+    const refreshToken = signRefreshToken({ 
+      id: user.id, 
+      email: user.email, 
+      username: user.username
+    });
+    
     // Return user without password
     const { password: _, ...userWithoutPassword } = user;
-    res.json({ token, user: { ...userWithoutPassword, roles: userRoles } });
+    res.json({ 
+      token: accessToken, // Keep 'token' for backward compatibility
+      accessToken, 
+      refreshToken,
+      user: { ...userWithoutPassword, roles: userRoles } 
+    });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Token refresh endpoint
+app.post('/api/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    
+    if (!refreshToken) {
+      return res.status(401).json({ error: 'Refresh token required' });
+    }
+    
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    
+    // Get fresh user data
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: { id: true, email: true, username: true, role: true }
+    });
+    
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+    
+    // Get user roles
+    const userRoles = await getUserRoles(user.id);
+    
+    // Generate new access token
+    const newAccessToken = signToken({ 
+      id: user.id, 
+      email: user.email, 
+      username: user.username,
+      role: user.role,
+      roles: userRoles
+    });
+    
+    res.json({ 
+      token: newAccessToken, // Keep 'token' for backward compatibility
+      accessToken: newAccessToken
+    });
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    res.status(401).json({ error: 'Invalid refresh token' });
   }
 });
 
@@ -539,16 +674,24 @@ const convoToDTO = async (convo) => {
 };
 
 // Users
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', auth, requireAdmin, async (req, res) => {
   const users = await prisma.user.findMany();
   res.json(users);
 });
 
-app.get('/api/users/:id', async (req, res) => {
+app.get('/api/users/:id', optionalAuth, async (req, res) => {
   const id = Number(req.params.id);
   const user = await prisma.user.findUnique({ where: { id } });
   if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json(user);
+  
+  // If user is viewing their own profile or is admin, show full details
+  if (req.user && (req.user.id === id || req.user.role === 'ADMIN')) {
+    res.json(user);
+  } else {
+    // Public profile - hide sensitive information
+    const { password, email, phone, address, ...publicUser } = user;
+    res.json(publicUser);
+  }
 });
 
 // User dashboard stats
@@ -614,7 +757,7 @@ app.patch('/api/admin/users/:id/password', auth, requireAdmin, async (req, res) 
   }
 });
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', auth, requireAdmin, async (req, res) => {
   const { username, email, role, firstName, lastName, phone, address } = req.body;
   try {
     const user = await prisma.user.create({ data: { username, email, role, firstName, lastName, phone, address } });
@@ -624,7 +767,7 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', auth, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   try {
     await prisma.user.delete({ where: { id } });
@@ -656,7 +799,7 @@ app.get('/api/users/:id/products', async (req, res) => {
   res.json(products);
 });
 
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', auth, async (req, res) => {
   try {
     const d = req.body || {};
     const product = await prisma.product.create({
@@ -673,7 +816,7 @@ app.post('/api/products', async (req, res) => {
         currentPrice: Number(d.currentPrice ?? d.startingPrice ?? 0),
         buyNowPrice: d.buyNowPrice == null ? null : Number(d.buyNowPrice),
         endDate: d.endDate ? new Date(d.endDate) : new Date(Date.now() + 7*24*60*60*1000),
-        userId: Number(d.userId ?? 0),
+        userId: req.user.id, // Use authenticated user's ID
       }
     });
     res.json(product);
@@ -682,19 +825,35 @@ app.post('/api/products', async (req, res) => {
   }
 });
 
-app.patch('/api/products/:id', async (req, res) => {
+app.patch('/api/products/:id', auth, async (req, res) => {
   const id = req.params.id;
   try {
-    const product = await prisma.product.update({ where: { id }, data: req.body });
-    res.json(product);
+    // Check if user owns the product or is admin
+    const product = await prisma.product.findUnique({ where: { id } });
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    
+    if (product.userId !== req.user.id && req.user.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    const updatedProduct = await prisma.product.update({ where: { id }, data: req.body });
+    res.json(updatedProduct);
   } catch (e) {
     res.status(400).json({ error: 'Unable to update product', detail: String(e) });
   }
 });
 
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', auth, async (req, res) => {
   const id = req.params.id;
   try {
+    // Check if user owns the product or is admin
+    const product = await prisma.product.findUnique({ where: { id } });
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    
+    if (product.userId !== req.user.id && req.user.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
     await prisma.bid.deleteMany({ where: { productId: id } });
     await prisma.watchlist.deleteMany({ where: { productId: id } });
     await prisma.cartItem.deleteMany({ where: { productId: id } });
@@ -706,11 +865,19 @@ app.delete('/api/products/:id', async (req, res) => {
 });
 
 // Bids (place bid)
-app.post('/api/products/:id/bids', async (req, res) => {
+app.post('/api/products/:id/bids', auth, async (req, res) => {
   const productId = req.params.id;
-  const { userId, maxBid } = req.body;
+  const { maxBid } = req.body;
+  const userId = req.user.id; // Use authenticated user's ID
+  
   const product = await prisma.product.findUnique({ where: { id: productId } });
   if (!product) return res.status(404).json({ error: 'Product not found' });
+  
+  // Check if user is trying to bid on their own product
+  if (product.userId === userId) {
+    return res.status(400).json({ error: 'Cannot bid on your own product' });
+  }
+  
   const bid = await prisma.bid.create({ data: { userId, productId, maxBid } });
   // Update currentPrice naively (for demo)
   const top = await prisma.bid.findMany({ where: { productId }, orderBy: { maxBid: 'desc' }, take: 2 });
@@ -721,29 +888,54 @@ app.post('/api/products/:id/bids', async (req, res) => {
 });
 
 // Messages (create/fetch)
-app.get('/api/conversations/:id/messages', async (req, res) => {
+app.get('/api/conversations/:id/messages', auth, async (req, res) => {
+  const convo = await prisma.conversation.findUnique({ where: { id: req.params.id } });
+  if (!convo) return res.status(404).json({ error: 'Conversation not found' });
+  
+  // Check if user is participant in conversation
+  if (!convo.participantIds.includes(req.user.id)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const messages = await prisma.message.findMany({ where: { conversationId: req.params.id }, orderBy: { timestamp: 'asc' } });
   res.json(messages);
 });
 
-app.get('/api/users/:id/conversations', async (req, res) => {
+app.get('/api/users/:id/conversations', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only see their own conversations unless they're admin
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const conversations = await prisma.conversation.findMany({ where: { participantIds: { has: userId } }, orderBy: { updatedAt: 'desc' } });
   const dtos = await Promise.all(conversations.map(convoToDTO));
   res.json(dtos);
 });
 
-app.get('/api/conversations/:id', async (req, res) => {
+app.get('/api/conversations/:id', auth, async (req, res) => {
   const convo = await prisma.conversation.findUnique({ where: { id: req.params.id } });
   if (!convo) return res.status(404).json({ error: 'Not found' });
+  
+  // Check if user is participant in conversation
+  if (!convo.participantIds.includes(req.user.id)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   res.json(await convoToDTO(convo));
 });
 
-app.post('/api/messages', async (req, res) => {
-  const { conversationId, senderId, text, recipientId, productId } = req.body;
+app.post('/api/messages', auth, async (req, res) => {
+  const { conversationId, text, recipientId, productId } = req.body;
+  const senderId = req.user.id; // Use authenticated user's ID
+  
   let convo;
   if (conversationId) {
     convo = await prisma.conversation.findUnique({ where: { id: conversationId } });
+    if (convo && !convo.participantIds.includes(senderId)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
   } else if (productId) {
     convo = await prisma.conversation.findFirst({ where: { productId, participantIds: { hasEvery: [senderId, recipientId] } } });
   } else {
@@ -779,32 +971,62 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // Watchlist
-app.get('/api/users/:id/watchlist', async (req, res) => {
+app.get('/api/users/:id/watchlist', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only see their own watchlist unless they're admin
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const items = await prisma.watchlist.findMany({ where: { userId } });
   res.json(items.map(i => i.productId));
 });
-app.post('/api/users/:id/watchlist', async (req, res) => {
+app.post('/api/users/:id/watchlist', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only modify their own watchlist
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const { productId } = req.body;
   await prisma.watchlist.upsert({ where: { userId_productId: { userId, productId } }, update: {}, create: { userId, productId } });
   res.json(true);
 });
-app.delete('/api/users/:id/watchlist/:productId', async (req, res) => {
+app.delete('/api/users/:id/watchlist/:productId', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only modify their own watchlist
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const productId = req.params.productId;
   await prisma.watchlist.deleteMany({ where: { userId, productId } });
   res.json(true);
 });
 
 // Cart
-app.get('/api/users/:id/cart', async (req, res) => {
+app.get('/api/users/:id/cart', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only see their own cart unless they're admin
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const items = await prisma.cartItem.findMany({ where: { userId }, include: { product: true } });
   res.json(items.map(i => ({ product: i.product, quantity: i.quantity })));
 });
-app.post('/api/users/:id/cart', async (req, res) => {
+app.post('/api/users/:id/cart', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only modify their own cart
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const { productId, quantity } = req.body;
   const existing = await prisma.cartItem.findUnique({ where: { userId_productId: { userId, productId } } });
   if (existing) {
@@ -815,15 +1037,27 @@ app.post('/api/users/:id/cart', async (req, res) => {
   const items = await prisma.cartItem.findMany({ where: { userId }, include: { product: true } });
   res.json(items.map(i => ({ product: i.product, quantity: i.quantity })));
 });
-app.delete('/api/users/:id/cart/:productId', async (req, res) => {
+app.delete('/api/users/:id/cart/:productId', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only modify their own cart
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const productId = req.params.productId;
   await prisma.cartItem.deleteMany({ where: { userId, productId } });
   const items = await prisma.cartItem.findMany({ where: { userId }, include: { product: true } });
   res.json(items.map(i => ({ product: i.product, quantity: i.quantity })));
 });
-app.post('/api/users/:id/checkout', async (req, res) => {
+app.post('/api/users/:id/checkout', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only checkout their own cart
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const items = await prisma.cartItem.findMany({ where: { userId }, include: { product: true } });
   const orders = await Promise.all(items.map(i => prisma.order.create({ data: {
     productId: i.productId,
@@ -838,17 +1072,37 @@ app.post('/api/users/:id/checkout', async (req, res) => {
 });
 
 // Notifications
-app.get('/api/users/:id/notifications', async (req, res) => {
+app.get('/api/users/:id/notifications', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only see their own notifications unless they're admin
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const list = await prisma.notification.findMany({ where: { userId }, orderBy: { timestamp: 'desc' } });
   res.json(list);
 });
-app.post('/api/notifications/:id/read', async (req, res) => {
+app.post('/api/notifications/:id/read', auth, async (req, res) => {
+  const notification = await prisma.notification.findUnique({ where: { id: req.params.id } });
+  if (!notification) return res.status(404).json({ error: 'Notification not found' });
+  
+  // Users can only mark their own notifications as read
+  if (notification.userId !== req.user.id && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   await prisma.notification.update({ where: { id: req.params.id }, data: { isRead: true } });
   res.json(true);
 });
-app.post('/api/users/:id/notifications/read-all', async (req, res) => {
+app.post('/api/users/:id/notifications/read-all', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only mark their own notifications as read
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   await prisma.notification.updateMany({ where: { userId }, data: { isRead: true } });
   res.json(true);
 });
@@ -879,7 +1133,7 @@ app.delete('/api/admin/news-categories/:id', auth, requireModeratorOrAdmin, asyn
   res.json(true);
 });
 
-app.post('/api/categories', async (req, res) => {
+app.post('/api/categories', auth, requireModeratorOrAdmin, async (req, res) => {
   try {
     const { name, description } = req.body;
     const category = await prisma.category.create({
@@ -891,7 +1145,7 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
-app.patch('/api/categories/:id', async (req, res) => {
+app.patch('/api/categories/:id', auth, requireModeratorOrAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const { name, description } = req.body;
@@ -905,7 +1159,7 @@ app.patch('/api/categories/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/categories/:id', async (req, res) => {
+app.delete('/api/categories/:id', auth, requireModeratorOrAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     await prisma.category.delete({ where: { id } });
@@ -916,10 +1170,18 @@ app.delete('/api/categories/:id', async (req, res) => {
 });
 
 // Disputes
-app.post('/api/disputes', async (req, res) => {
-  const { orderId, userId, reason } = req.body;
+app.post('/api/disputes', auth, async (req, res) => {
+  const { orderId, reason } = req.body;
+  const userId = req.user.id; // Use authenticated user's ID
+  
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) return res.status(404).json({ error: 'Order not found' });
+  
+  // Users can only create disputes for their own orders
+  if (order.buyerId !== userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const dispute = await prisma.dispute.create({ data: {
     orderId,
     userId,
@@ -929,8 +1191,14 @@ app.post('/api/disputes', async (req, res) => {
   await prisma.order.update({ where: { id: orderId }, data: { status: 'DISPUTED' } });
   res.json(dispute);
 });
-app.get('/api/users/:id/disputes', async (req, res) => {
+app.get('/api/users/:id/disputes', auth, async (req, res) => {
   const userId = Number(req.params.id);
+  
+  // Users can only see their own disputes unless they're admin
+  if (req.user.id !== userId && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  
   const disputes = await prisma.dispute.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } });
   res.json(disputes);
 });
@@ -1563,22 +1831,1763 @@ async function initializeAndStart() {
     const PORT = process.env.PORT || 4000;
     server.listen(PORT, () => {
       console.log(`API listening on :${PORT}`);
+      
+      // Start dropshipping order automation
+      import('./services/orderAutomation.service.js')
+        .then(({ default: orderAutomationService }) => {
+          orderAutomationService.startTrackingCron();
+        })
+        .catch(err => {
+          console.warn('[startup] Could not start order automation:', err.message);
+        });
     });
   }
 }
 
-// Serve static files from the frontend build directory
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
+// =========================
+// Subscription Middleware and Utilities
+// =========================
 
-// Catch-all handler: send back React's index.html file for any non-API routes
-app.get('*', (req, res) => {
-  // Only serve index.html for non-API routes
-  if (!req.path.startsWith('/api/')) {
-    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
-  } else {
-    res.status(404).json({ error: 'API endpoint not found' });
+// Middleware to check if user has active subscription
+const requireSubscription = (requiredFeatures = []) => {
+  return async (req, res, next) => {
+    try {
+      const subscription = await prisma.userSubscription.findFirst({
+        where: { 
+          userId: req.user.id,
+          status: 'ACTIVE'
+        },
+        include: { plan: true }
+      });
+      
+      if (!subscription) {
+        return res.status(403).json({ 
+          error: 'Active subscription required',
+          code: 'SUBSCRIPTION_REQUIRED'
+        });
+      }
+      
+      // Check specific features if required
+      if (requiredFeatures.length > 0) {
+        const plan = subscription.plan;
+        const missingFeatures = requiredFeatures.filter(feature => {
+          switch (feature) {
+            case 'analytics':
+              return !plan.analyticsAccess;
+            case 'api':
+              return !plan.apiAccess;
+            case 'customBranding':
+              return !plan.customBranding;
+            case 'prioritySupport':
+              return !plan.prioritySupport;
+            default:
+              return false;
+          }
+        });
+        
+        if (missingFeatures.length > 0) {
+          return res.status(403).json({
+            error: `Subscription plan doesn't include: ${missingFeatures.join(', ')}`,
+            code: 'FEATURE_NOT_INCLUDED',
+            missingFeatures
+          });
+        }
+      }
+      
+      req.subscription = subscription;
+      next();
+    } catch (error) {
+      console.error('Error checking subscription:', error);
+      res.status(500).json({ error: 'Failed to verify subscription' });
+    }
+  };
+};
+
+// Middleware to check product limits
+const checkProductLimit = async (req, res, next) => {
+  try {
+    const subscription = await prisma.userSubscription.findFirst({
+      where: { 
+        userId: req.user.id,
+        status: 'ACTIVE'
+      },
+      include: { plan: true }
+    });
+    
+    if (subscription && subscription.plan.maxProducts) {
+      const productCount = await prisma.product.count({
+        where: { userId: req.user.id }
+      });
+      
+      if (productCount >= subscription.plan.maxProducts) {
+        return res.status(403).json({
+          error: `Product limit reached. Maximum ${subscription.plan.maxProducts} products allowed.`,
+          code: 'PRODUCT_LIMIT_REACHED',
+          limit: subscription.plan.maxProducts,
+          current: productCount
+        });
+      }
+    }
+    
+    next();
+  } catch (error) {
+    console.error('Error checking product limit:', error);
+    res.status(500).json({ error: 'Failed to check product limit' });
+  }
+};
+
+// =========================
+// Crypto Payment APIs
+// =========================
+
+// Get supported cryptocurrencies
+app.get('/api/crypto/currencies', async (req, res) => {
+  try {
+    const currencies = [
+      { symbol: 'BTC', name: 'Bitcoin', icon: '₿' },
+      { symbol: 'ETH', name: 'Ethereum', icon: 'Ξ' },
+      { symbol: 'USDT', name: 'Tether USD', icon: '₮' },
+      { symbol: 'USDC', name: 'USD Coin', icon: '$' },
+      { symbol: 'BNB', name: 'Binance Coin', icon: 'B' },
+      { symbol: 'ADA', name: 'Cardano', icon: '₳' },
+      { symbol: 'SOL', name: 'Solana', icon: '◎' },
+      { symbol: 'MATIC', name: 'Polygon', icon: '⬟' },
+      { symbol: 'AVAX', name: 'Avalanche', icon: '🔺' },
+      { symbol: 'DOT', name: 'Polkadot', icon: '●' }
+    ];
+    res.json(currencies);
+  } catch (error) {
+    console.error('Error fetching crypto currencies:', error);
+    res.status(500).json({ error: 'Failed to fetch crypto currencies' });
   }
 });
+
+// Get crypto exchange rates
+app.get('/api/crypto/rates', async (req, res) => {
+  try {
+    // Get latest rates from database
+    const rates = await prisma.cryptoExchangeRate.findMany({
+      where: {
+        lastUpdated: {
+          gte: new Date(Date.now() - 5 * 60 * 1000) // Last 5 minutes
+        }
+      },
+      orderBy: { lastUpdated: 'desc' }
+    });
+    
+    if (rates.length === 0) {
+      // If no recent rates, return default rates (you can integrate with CoinGecko API)
+      const defaultRates = [
+        { currency: 'BTC', usdRate: 45000 },
+        { currency: 'ETH', usdRate: 3000 },
+        { currency: 'USDT', usdRate: 1 },
+        { currency: 'USDC', usdRate: 1 },
+        { currency: 'BNB', usdRate: 300 },
+        { currency: 'ADA', usdRate: 0.5 },
+        { currency: 'SOL', usdRate: 100 },
+        { currency: 'MATIC', usdRate: 0.8 },
+        { currency: 'AVAX', usdRate: 25 },
+        { currency: 'DOT', usdRate: 6 }
+      ];
+      return res.json(defaultRates);
+    }
+    
+    res.json(rates);
+  } catch (error) {
+    console.error('Error fetching crypto rates:', error);
+    res.status(500).json({ error: 'Failed to fetch crypto rates' });
+  }
+});
+
+// Create crypto payment
+app.post('/api/crypto/payment/create', auth, async (req, res) => {
+  try {
+    const { subscriptionId, currency, usdAmount } = req.body;
+    
+    if (!subscriptionId || !currency || !usdAmount) {
+      return res.status(400).json({ 
+        error: 'Subscription ID, currency, and USD amount are required' 
+      });
+    }
+    
+    // Get subscription
+    const subscription = await prisma.userSubscription.findFirst({
+      where: { 
+        id: subscriptionId,
+        userId: req.user.id,
+        status: 'PENDING'
+      },
+      include: { plan: true }
+    });
+    
+    if (!subscription) {
+      return res.status(404).json({ error: 'Subscription not found' });
+    }
+    
+    // Get current exchange rate
+    const rate = await prisma.cryptoExchangeRate.findFirst({
+      where: { currency },
+      orderBy: { lastUpdated: 'desc' }
+    });
+    
+    if (!rate) {
+      return res.status(400).json({ error: 'Exchange rate not available for this currency' });
+    }
+    
+    // Calculate crypto amount
+    const cryptoAmount = parseFloat(usdAmount) / rate.usdRate;
+    
+    // Get or create wallet for this currency
+    let wallet = await prisma.cryptoWallet.findFirst({
+      where: { currency, isActive: true }
+    });
+    
+    if (!wallet) {
+      // Generate a new wallet address (in production, use proper wallet generation)
+      const address = generateWalletAddress(currency);
+      wallet = await prisma.cryptoWallet.create({
+        data: {
+          currency,
+          address,
+          label: `${currency} Payment Wallet`,
+          isActive: true
+        }
+      });
+    }
+    
+    // Create payment record
+    const payment = await prisma.payment.create({
+      data: {
+        userId: req.user.id,
+        subscriptionId: subscription.id,
+        amount: parseFloat(usdAmount),
+        currency: 'USD',
+        status: 'PENDING',
+        method: 'CRYPTO',
+        description: `Crypto payment for ${subscription.plan.name}`,
+        metadata: {
+          cryptoCurrency: currency,
+          cryptoAmount: cryptoAmount,
+          exchangeRate: rate.usdRate
+        }
+      }
+    });
+    
+    // Create crypto payment
+    const cryptoPayment = await prisma.cryptoPayment.create({
+      data: {
+        userId: req.user.id,
+        subscriptionId: subscription.id,
+        paymentId: payment.id,
+        currency,
+        amount: cryptoAmount,
+        usdAmount: parseFloat(usdAmount),
+        exchangeRate: rate.usdRate,
+        walletAddress: wallet.address,
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 minutes
+        status: 'PENDING'
+      }
+    });
+    
+    res.json({
+      cryptoPayment,
+      payment,
+      walletAddress: wallet.address,
+      amount: cryptoAmount,
+      currency,
+      expiresAt: cryptoPayment.expiresAt,
+      qrCode: generateQRCode(wallet.address, cryptoAmount, currency)
+    });
+  } catch (error) {
+    console.error('Error creating crypto payment:', error);
+    res.status(500).json({ error: 'Failed to create crypto payment' });
+  }
+});
+
+// Check crypto payment status
+app.get('/api/crypto/payment/:id/status', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const cryptoPayment = await prisma.cryptoPayment.findFirst({
+      where: { 
+        id,
+        userId: req.user.id
+      },
+      include: {
+        payment: true,
+        subscription: {
+          include: { plan: true }
+        }
+      }
+    });
+    
+    if (!cryptoPayment) {
+      return res.status(404).json({ error: 'Crypto payment not found' });
+    }
+    
+    // Check if payment has expired
+    if (cryptoPayment.status === 'PENDING' && new Date() > cryptoPayment.expiresAt) {
+      await prisma.cryptoPayment.update({
+        where: { id },
+        data: { status: 'EXPIRED' }
+      });
+      cryptoPayment.status = 'EXPIRED';
+    }
+    
+    res.json(cryptoPayment);
+  } catch (error) {
+    console.error('Error checking crypto payment status:', error);
+    res.status(500).json({ error: 'Failed to check payment status' });
+  }
+});
+
+// Webhook for crypto payment confirmation (called by blockchain monitoring service)
+app.post('/api/crypto/payment/webhook', async (req, res) => {
+  try {
+    const { 
+      cryptoPaymentId, 
+      transactionHash, 
+      fromAddress, 
+      confirmations,
+      status 
+    } = req.body;
+    
+    if (!cryptoPaymentId || !transactionHash) {
+      return res.status(400).json({ error: 'Crypto payment ID and transaction hash are required' });
+    }
+    
+    const cryptoPayment = await prisma.cryptoPayment.findUnique({
+      where: { id: cryptoPaymentId },
+      include: { payment: true, subscription: true }
+    });
+    
+    if (!cryptoPayment) {
+      return res.status(404).json({ error: 'Crypto payment not found' });
+    }
+    
+    const updateData = {
+      transactionHash,
+      fromAddress: fromAddress || cryptoPayment.fromAddress,
+      confirmations: confirmations || cryptoPayment.confirmations
+    };
+    
+    if (status === 'CONFIRMED' || (confirmations && confirmations >= cryptoPayment.requiredConfirmations)) {
+      updateData.status = 'CONFIRMED';
+      updateData.confirmedAt = new Date();
+      
+      // Update payment status
+      await prisma.payment.update({
+        where: { id: cryptoPayment.paymentId },
+        data: {
+          status: 'COMPLETED',
+          paidAt: new Date(),
+          transactionId: transactionHash
+        }
+      });
+      
+      // Activate subscription
+      if (cryptoPayment.subscription) {
+        await prisma.userSubscription.update({
+          where: { id: cryptoPayment.subscriptionId },
+          data: { status: 'ACTIVE' }
+        });
+      }
+    } else if (status === 'FAILED') {
+      updateData.status = 'FAILED';
+      updateData.failedAt = new Date();
+      
+      // Update payment status
+      await prisma.payment.update({
+        where: { id: cryptoPayment.paymentId },
+        data: { status: 'FAILED', failedAt: new Date() }
+      });
+    }
+    
+    const updatedCryptoPayment = await prisma.cryptoPayment.update({
+      where: { id: cryptoPaymentId },
+      data: updateData
+    });
+    
+    res.json({ cryptoPayment: updatedCryptoPayment });
+  } catch (error) {
+    console.error('Error processing crypto payment webhook:', error);
+    res.status(500).json({ error: 'Failed to process payment webhook' });
+  }
+});
+
+// Get user's crypto payment history
+app.get('/api/crypto/payments', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10, currency } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const where = { userId: req.user.id };
+    if (currency) {
+      where.currency = currency;
+    }
+    
+    const cryptoPayments = await prisma.cryptoPayment.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        payment: true,
+        subscription: {
+          include: { plan: true }
+        }
+      }
+    });
+    
+    const total = await prisma.cryptoPayment.count({ where });
+    
+    res.json({
+      cryptoPayments,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching crypto payment history:', error);
+    res.status(500).json({ error: 'Failed to fetch crypto payment history' });
+  }
+});
+
+// Admin: Get all crypto payments
+app.get('/api/admin/crypto/payments', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status, currency } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const where = {};
+    if (status) where.status = status;
+    if (currency) where.currency = currency;
+    
+    const cryptoPayments = await prisma.cryptoPayment.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        user: {
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            firstName: true,
+            lastName: true
+          }
+        },
+        payment: true,
+        subscription: {
+          include: { plan: true }
+        }
+      }
+    });
+    
+    const total = await prisma.cryptoPayment.count({ where });
+    
+    res.json({
+      cryptoPayments,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching crypto payments:', error);
+    res.status(500).json({ error: 'Failed to fetch crypto payments' });
+  }
+});
+
+// Helper functions for crypto payments
+function generateWalletAddress(currency) {
+  // In production, use proper wallet generation libraries
+  // This is a simplified example
+  const prefix = {
+    'BTC': '1',
+    'ETH': '0x',
+    'USDT': '0x',
+    'USDC': '0x',
+    'BNB': '0x',
+    'ADA': 'addr1',
+    'SOL': '',
+    'MATIC': '0x',
+    'AVAX': '0x',
+    'DOT': '1'
+  };
+  
+  const randomString = Math.random().toString(36).substring(2, 15) + 
+                     Math.random().toString(36).substring(2, 15);
+  return (prefix[currency] || '') + randomString;
+}
+
+function generateQRCode(address, amount, currency) {
+  // In production, use a proper QR code library
+  // This returns a data URL for the QR code
+  const qrData = `${currency}:${address}?amount=${amount}`;
+  return `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==`;
+}
+
+// =========================
+// Cross-Domain Authentication APIs
+// =========================
+
+// Get user info for cross-domain authentication
+app.get('/api/auth/user', auth, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        createdAt: true,
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          include: { plan: true },
+          take: 1
+        }
+      }
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ user });
+  } catch (error) {
+    console.error('Error fetching user info:', error);
+    res.status(500).json({ error: 'Failed to fetch user info' });
+  }
+});
+
+// Validate token for cross-domain authentication
+app.post('/api/auth/validate', async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        subscriptions: {
+          where: { status: 'ACTIVE' },
+          include: { plan: true },
+          take: 1
+        }
+      }
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ 
+      valid: true, 
+      user,
+      expiresAt: new Date(decoded.exp * 1000)
+    });
+  } catch (error) {
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    console.error('Error validating token:', error);
+    res.status(500).json({ error: 'Failed to validate token' });
+  }
+});
+
+// Get user's service access permissions
+app.get('/api/auth/services', auth, async (req, res) => {
+  try {
+    const subscription = await prisma.userSubscription.findFirst({
+      where: { 
+        userId: req.user.id,
+        status: 'ACTIVE'
+      },
+      include: { plan: true }
+    });
+    
+    const services = {
+      auction: {
+        name: 'Auction Platform',
+        url: 'https://www.shltechent.com',
+        accessible: true,
+        features: {
+          productListing: subscription ? (subscription.plan.maxProducts || 0) : 5,
+          bidding: true,
+          messaging: true
+        }
+      },
+      currex: {
+        name: 'Currency Exchange',
+        url: 'https://currex.shltechent.com',
+        accessible: true,
+        features: {
+          liveRates: true,
+          historicalData: true,
+          adminPanel: req.user.role === 'ADMIN' || req.user.role === 'MODERATOR'
+        }
+      },
+      qr: {
+        name: 'QR Generator',
+        url: 'https://qr.shltechent.com',
+        accessible: true,
+        features: {
+          basicGeneration: true,
+          customBranding: subscription ? subscription.plan.customBranding : false,
+          analytics: subscription ? subscription.plan.analyticsAccess : false,
+          bulkGeneration: subscription ? (subscription.plan.maxProducts > 25) : false
+        }
+      }
+    };
+    
+    res.json({ services });
+  } catch (error) {
+    console.error('Error fetching service permissions:', error);
+    res.status(500).json({ error: 'Failed to fetch service permissions' });
+  }
+});
+
+// =========================
+// Subscription and Payment APIs
+// =========================
+
+// Get all subscription plans
+app.get('/api/subscription/plans', async (req, res) => {
+  try {
+    const plans = await prisma.subscriptionPlan.findMany({
+      where: { isActive: true },
+      orderBy: { price: 'asc' }
+    });
+    res.json(plans);
+  } catch (error) {
+    console.error('Error fetching subscription plans:', error);
+    res.status(500).json({ error: 'Failed to fetch subscription plans' });
+  }
+});
+
+// Get user's current subscription
+app.get('/api/subscription/current', auth, async (req, res) => {
+  try {
+    const subscription = await prisma.userSubscription.findFirst({
+      where: { 
+        userId: req.user.id,
+        status: { in: ['ACTIVE', 'PENDING'] }
+      },
+      include: {
+        plan: true,
+        payments: {
+          orderBy: { createdAt: 'desc' },
+          take: 5
+        }
+      }
+    });
+    
+    if (!subscription) {
+      return res.json({ subscription: null });
+    }
+    
+    res.json({ subscription });
+  } catch (error) {
+    console.error('Error fetching user subscription:', error);
+    res.status(500).json({ error: 'Failed to fetch subscription' });
+  }
+});
+
+// Create new subscription
+app.post('/api/subscription/subscribe', auth, async (req, res) => {
+  try {
+    const { planId, paymentMethodId } = req.body;
+    
+    if (!planId) {
+      return res.status(400).json({ error: 'Plan ID is required' });
+    }
+    
+    // Check if user already has an active subscription
+    const existingSubscription = await prisma.userSubscription.findFirst({
+      where: { 
+        userId: req.user.id,
+        status: { in: ['ACTIVE', 'PENDING'] }
+      }
+    });
+    
+    if (existingSubscription) {
+      return res.status(400).json({ error: 'User already has an active subscription' });
+    }
+    
+    // Get the plan
+    const plan = await prisma.subscriptionPlan.findUnique({
+      where: { id: planId }
+    });
+    
+    if (!plan) {
+      return res.status(404).json({ error: 'Subscription plan not found' });
+    }
+    
+    // Calculate billing dates
+    const startDate = new Date();
+    const endDate = new Date();
+    const nextBillingDate = new Date();
+    
+    switch (plan.billingInterval) {
+      case 'monthly':
+        endDate.setMonth(endDate.getMonth() + 1);
+        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+        break;
+      case 'yearly':
+        endDate.setFullYear(endDate.getFullYear() + 1);
+        nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+        break;
+      case 'weekly':
+        endDate.setDate(endDate.getDate() + 7);
+        nextBillingDate.setDate(nextBillingDate.getDate() + 7);
+        break;
+      case 'daily':
+        endDate.setDate(endDate.getDate() + 1);
+        nextBillingDate.setDate(nextBillingDate.getDate() + 1);
+        break;
+    }
+    
+    // Create subscription
+    const subscription = await prisma.userSubscription.create({
+      data: {
+        userId: req.user.id,
+        planId: plan.id,
+        status: 'PENDING',
+        startDate,
+        endDate,
+        nextBillingDate,
+        autoRenew: true
+      },
+      include: {
+        plan: true
+      }
+    });
+    
+    // Create payment record
+    const payment = await prisma.payment.create({
+      data: {
+        userId: req.user.id,
+        subscriptionId: subscription.id,
+        amount: plan.price,
+        currency: plan.currency,
+        status: 'PENDING',
+        method: paymentMethodId ? 'CREDIT_CARD' : 'BANK_TRANSFER',
+        description: `Subscription to ${plan.name}`,
+        metadata: {
+          planId: plan.id,
+          billingInterval: plan.billingInterval
+        }
+      }
+    });
+    
+    res.json({ 
+      subscription, 
+      payment,
+      message: 'Subscription created successfully. Please complete payment to activate.' 
+    });
+  } catch (error) {
+    console.error('Error creating subscription:', error);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+// Cancel subscription
+app.post('/api/subscription/cancel', auth, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    
+    const subscription = await prisma.userSubscription.findFirst({
+      where: { 
+        userId: req.user.id,
+        status: 'ACTIVE'
+      }
+    });
+    
+    if (!subscription) {
+      return res.status(404).json({ error: 'No active subscription found' });
+    }
+    
+    const updatedSubscription = await prisma.userSubscription.update({
+      where: { id: subscription.id },
+      data: {
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+        cancellationReason: reason,
+        autoRenew: false
+      },
+      include: {
+        plan: true
+      }
+    });
+    
+    res.json({ 
+      subscription: updatedSubscription,
+      message: 'Subscription cancelled successfully' 
+    });
+  } catch (error) {
+    console.error('Error cancelling subscription:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+// Update payment status (webhook endpoint)
+app.post('/api/subscription/payment/webhook', async (req, res) => {
+  try {
+    const { paymentId, status, transactionId, externalId } = req.body;
+    
+    if (!paymentId || !status) {
+      return res.status(400).json({ error: 'Payment ID and status are required' });
+    }
+    
+    const payment = await prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: { subscription: true }
+    });
+    
+    if (!payment) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    const updateData = {
+      status: status.toUpperCase(),
+      transactionId: transactionId || payment.transactionId,
+      externalId: externalId || payment.externalId
+    };
+    
+    if (status === 'COMPLETED') {
+      updateData.paidAt = new Date();
+      
+      // Activate subscription if payment is completed
+      if (payment.subscription) {
+        await prisma.userSubscription.update({
+          where: { id: payment.subscription.id },
+          data: { status: 'ACTIVE' }
+        });
+      }
+    } else if (status === 'FAILED') {
+      updateData.failedAt = new Date();
+    }
+    
+    const updatedPayment = await prisma.payment.update({
+      where: { id: paymentId },
+      data: updateData
+    });
+    
+    res.json({ payment: updatedPayment });
+  } catch (error) {
+    console.error('Error updating payment status:', error);
+    res.status(500).json({ error: 'Failed to update payment status' });
+  }
+});
+
+// Get user's payment history
+app.get('/api/subscription/payments', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const payments = await prisma.payment.findMany({
+      where: { userId: req.user.id },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        subscription: {
+          include: {
+            plan: true
+          }
+        }
+      }
+    });
+    
+    const total = await prisma.payment.count({
+      where: { userId: req.user.id }
+    });
+    
+    res.json({
+      payments,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching payment history:', error);
+    res.status(500).json({ error: 'Failed to fetch payment history' });
+  }
+});
+
+// Get user's invoices
+app.get('/api/subscription/invoices', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const invoices = await prisma.invoice.findMany({
+      where: { userId: req.user.id },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        subscription: {
+          include: {
+            plan: true
+          }
+        },
+        payment: true
+      }
+    });
+    
+    const total = await prisma.invoice.count({
+      where: { userId: req.user.id }
+    });
+    
+    res.json({
+      invoices,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching invoices:', error);
+    res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
+// Admin: Get all subscriptions
+app.get('/api/admin/subscriptions', requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const where = status ? { status } : {};
+    
+    const subscriptions = await prisma.userSubscription.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        user: {
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            firstName: true,
+            lastName: true
+          }
+        },
+        plan: true,
+        payments: {
+          orderBy: { createdAt: 'desc' },
+          take: 1
+        }
+      }
+    });
+    
+    const total = await prisma.userSubscription.count({ where });
+    
+    res.json({
+      subscriptions,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching subscriptions:', error);
+    res.status(500).json({ error: 'Failed to fetch subscriptions' });
+  }
+});
+
+// Admin: Create subscription plan
+app.post('/api/admin/subscription/plans', requireAdmin, async (req, res) => {
+  try {
+    const {
+      name,
+      description,
+      price,
+      currency = 'USD',
+      billingInterval,
+      features,
+      maxProducts,
+      maxBids,
+      prioritySupport = false,
+      analyticsAccess = false,
+      customBranding = false,
+      apiAccess = false
+    } = req.body;
+    
+    if (!name || !price || !billingInterval) {
+      return res.status(400).json({ error: 'Name, price, and billing interval are required' });
+    }
+    
+    const plan = await prisma.subscriptionPlan.create({
+      data: {
+        name,
+        description,
+        price: parseFloat(price),
+        currency,
+        billingInterval,
+        features: features || [],
+        maxProducts: maxProducts ? parseInt(maxProducts) : null,
+        maxBids: maxBids ? parseInt(maxBids) : null,
+        prioritySupport,
+        analyticsAccess,
+        customBranding,
+        apiAccess
+      }
+    });
+    
+    res.json(plan);
+  } catch (error) {
+    console.error('Error creating subscription plan:', error);
+    res.status(500).json({ error: 'Failed to create subscription plan' });
+  }
+});
+
+// Admin: Update subscription plan
+app.put('/api/admin/subscription/plans/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+    
+    // Remove fields that shouldn't be updated
+    delete updateData.id;
+    delete updateData.createdAt;
+    delete updateData.updatedAt;
+    
+    const plan = await prisma.subscriptionPlan.update({
+      where: { id },
+      data: updateData
+    });
+    
+    res.json(plan);
+  } catch (error) {
+    console.error('Error updating subscription plan:', error);
+    res.status(500).json({ error: 'Failed to update subscription plan' });
+  }
+});
+
+// Admin: Delete subscription plan
+app.delete('/api/admin/subscription/plans/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check if plan has active subscriptions
+    const activeSubscriptions = await prisma.userSubscription.count({
+      where: {
+        planId: id,
+        status: { in: ['ACTIVE', 'PENDING'] }
+      }
+    });
+    
+    if (activeSubscriptions > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete plan with active subscriptions. Deactivate instead.' 
+      });
+    }
+    
+    await prisma.subscriptionPlan.delete({
+      where: { id }
+    });
+    
+    res.json({ message: 'Subscription plan deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting subscription plan:', error);
+    res.status(500).json({ error: 'Failed to delete subscription plan' });
+  }
+});
+
+// ==================== DYNAMIC QR CODE APIs ====================
+
+// Generate a random short code
+function generateShortCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 8; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+// Create a new dynamic QR code
+app.post('/api/qr/dynamic', auth, async (req, res) => {
+  try {
+    const { destinationUrl, title, description, metadata } = req.body;
+    
+    if (!destinationUrl) {
+      return res.status(400).json({ error: 'Destination URL is required' });
+    }
+    
+    // Validate URL
+    try {
+      new URL(destinationUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid destination URL' });
+    }
+    
+    // Generate unique short code
+    let shortCode;
+    let isUnique = false;
+    let attempts = 0;
+    
+    while (!isUnique && attempts < 10) {
+      shortCode = generateShortCode();
+      const existing = await prisma.dynamicQrCode.findUnique({
+        where: { shortCode }
+      });
+      isUnique = !existing;
+      attempts++;
+    }
+    
+    if (!isUnique) {
+      return res.status(500).json({ error: 'Failed to generate unique short code' });
+    }
+    
+    const shortUrl = `https://qr.shltechent.com/${shortCode}`;
+    
+    // Check user's subscription for trial period
+    const userSubscription = await prisma.userSubscription.findFirst({
+      where: {
+        userId: req.user.id,
+        status: 'ACTIVE'
+      },
+      include: { plan: true }
+    });
+    
+    const isTrial = !userSubscription || userSubscription.plan.name === 'Free';
+    const trialEndsAt = isTrial ? new Date(Date.now() + 10 * 24 * 60 * 60 * 1000) : null; // 10 days trial
+    
+    const qrCode = await prisma.dynamicQrCode.create({
+      data: {
+        userId: req.user.id,
+        shortCode,
+        shortUrl,
+        destinationUrl,
+        title: title || `QR Code ${shortCode}`,
+        description,
+        metadata: metadata || {},
+        isTrial,
+        trialEndsAt
+      }
+    });
+    
+    res.json(qrCode);
+  } catch (error) {
+    console.error('Error creating dynamic QR code:', error);
+    res.status(500).json({ error: 'Failed to create dynamic QR code' });
+  }
+});
+
+// Get user's dynamic QR codes
+app.get('/api/qr/dynamic', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const qrCodes = await prisma.dynamicQrCode.findMany({
+      where: { userId: req.user.id },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit),
+      include: {
+        scans: {
+          orderBy: { scannedAt: 'desc' },
+          take: 5
+        }
+      }
+    });
+    
+    const total = await prisma.dynamicQrCode.count({
+      where: { userId: req.user.id }
+    });
+    
+    res.json({
+      qrCodes,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching dynamic QR codes:', error);
+    res.status(500).json({ error: 'Failed to fetch dynamic QR codes' });
+  }
+});
+
+// Get specific dynamic QR code
+app.get('/api/qr/dynamic/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const qrCode = await prisma.dynamicQrCode.findFirst({
+      where: {
+        id,
+        userId: req.user.id
+      },
+      include: {
+        scans: {
+          orderBy: { scannedAt: 'desc' }
+        }
+      }
+    });
+    
+    if (!qrCode) {
+      return res.status(404).json({ error: 'QR code not found' });
+    }
+    
+    res.json(qrCode);
+  } catch (error) {
+    console.error('Error fetching dynamic QR code:', error);
+    res.status(500).json({ error: 'Failed to fetch dynamic QR code' });
+  }
+});
+
+// Update dynamic QR code
+app.put('/api/qr/dynamic/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { destinationUrl, title, description, metadata } = req.body;
+    
+    // Validate URL if provided
+    if (destinationUrl) {
+      try {
+        new URL(destinationUrl);
+      } catch {
+        return res.status(400).json({ error: 'Invalid destination URL' });
+      }
+    }
+    
+    const qrCode = await prisma.dynamicQrCode.findFirst({
+      where: {
+        id,
+        userId: req.user.id
+      }
+    });
+    
+    if (!qrCode) {
+      return res.status(404).json({ error: 'QR code not found' });
+    }
+    
+    const updatedQrCode = await prisma.dynamicQrCode.update({
+      where: { id },
+      data: {
+        ...(destinationUrl && { destinationUrl }),
+        ...(title && { title }),
+        ...(description && { description }),
+        ...(metadata && { metadata })
+      }
+    });
+    
+    res.json(updatedQrCode);
+  } catch (error) {
+    console.error('Error updating dynamic QR code:', error);
+    res.status(500).json({ error: 'Failed to update dynamic QR code' });
+  }
+});
+
+// Delete dynamic QR code
+app.delete('/api/qr/dynamic/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const qrCode = await prisma.dynamicQrCode.findFirst({
+      where: {
+        id,
+        userId: req.user.id
+      }
+    });
+    
+    if (!qrCode) {
+      return res.status(404).json({ error: 'QR code not found' });
+    }
+    
+    await prisma.dynamicQrCode.delete({
+      where: { id }
+    });
+    
+    res.json({ message: 'QR code deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting dynamic QR code:', error);
+    res.status(500).json({ error: 'Failed to delete dynamic QR code' });
+  }
+});
+
+// QR Code redirect endpoint (public) - for qr.shltechent.com subdomain
+app.get('/:shortCode', async (req, res, next) => {
+  // Skip this route for API paths, static files, etc
+  if (req.params.shortCode.startsWith('api') || req.params.shortCode.includes('.')) {
+    return next();
+  }
+  try {
+    const { shortCode } = req.params;
+    
+    const qrCode = await prisma.dynamicQrCode.findUnique({
+      where: { shortCode }
+    });
+    
+    if (!qrCode) {
+      return res.status(404).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>QR Code Not Found</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #e74c3c; }
+          </style>
+        </head>
+        <body>
+          <h1 class="error">QR Code Not Found</h1>
+          <p>The QR code you scanned is invalid or has been removed.</p>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Check if QR code is expired (trial users)
+    if (qrCode.isTrial && qrCode.trialEndsAt && new Date() > qrCode.trialEndsAt) {
+      return res.status(410).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Trial Expired</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #e74c3c; }
+            .cta { background: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 20px; }
+          </style>
+        </head>
+        <body>
+          <h1 class="error">Trial Expired</h1>
+          <p>This QR code's trial period has ended. Upgrade to continue using dynamic QR codes.</p>
+          <a href="https://qr-suite.shltechent.com" class="cta">Upgrade Now</a>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Check if QR code is inactive
+    if (qrCode.status !== 'ACTIVE') {
+      return res.status(410).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>QR Code Inactive</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #e74c3c; }
+          </style>
+        </head>
+        <body>
+          <h1 class="error">QR Code Inactive</h1>
+          <p>This QR code has been deactivated by its owner.</p>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Log the scan
+    const scanData = {
+      qrCodeId: qrCode.id,
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent'),
+      referrer: req.get('Referer'),
+      scannedAt: new Date()
+    };
+    
+    // Try to get location data (simplified)
+    try {
+      // You could integrate with a geolocation service here
+      scanData.country = 'Unknown';
+      scanData.city = 'Unknown';
+    } catch (error) {
+      console.log('Could not determine location:', error);
+    }
+    
+    // Detect device type
+    const userAgent = req.get('User-Agent') || '';
+    if (userAgent.includes('Mobile') || userAgent.includes('Android') || userAgent.includes('iPhone')) {
+      scanData.device = 'mobile';
+    } else if (userAgent.includes('Tablet') || userAgent.includes('iPad')) {
+      scanData.device = 'tablet';
+    } else {
+      scanData.device = 'desktop';
+    }
+    
+    // Detect browser
+    if (userAgent.includes('Chrome')) scanData.browser = 'Chrome';
+    else if (userAgent.includes('Firefox')) scanData.browser = 'Firefox';
+    else if (userAgent.includes('Safari')) scanData.browser = 'Safari';
+    else if (userAgent.includes('Edge')) scanData.browser = 'Edge';
+    else scanData.browser = 'Other';
+    
+    // Detect OS
+    if (userAgent.includes('Windows')) scanData.os = 'Windows';
+    else if (userAgent.includes('Mac')) scanData.os = 'macOS';
+    else if (userAgent.includes('Linux')) scanData.os = 'Linux';
+    else if (userAgent.includes('Android')) scanData.os = 'Android';
+    else if (userAgent.includes('iPhone') || userAgent.includes('iPad')) scanData.os = 'iOS';
+    else scanData.os = 'Other';
+    
+    // Create scan record
+    await prisma.qrCodeScan.create({
+      data: scanData
+    });
+    
+    // Update QR code scan count
+    await prisma.dynamicQrCode.update({
+      where: { id: qrCode.id },
+      data: {
+        scanCount: { increment: 1 },
+        lastScannedAt: new Date()
+      }
+    });
+    
+    // Redirect to destination
+    res.redirect(qrCode.destinationUrl);
+  } catch (error) {
+    console.error('Error processing QR code redirect:', error);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Error</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+          .error { color: #e74c3c; }
+        </style>
+      </head>
+      <body>
+        <h1 class="error">Error</h1>
+        <p>An error occurred while processing your request.</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// Get QR code analytics
+app.get('/api/qr/dynamic/:id/analytics', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { period = '7d' } = req.query;
+    
+    const qrCode = await prisma.dynamicQrCode.findFirst({
+      where: {
+        id,
+        userId: req.user.id
+      }
+    });
+    
+    if (!qrCode) {
+      return res.status(404).json({ error: 'QR code not found' });
+    }
+    
+    // Calculate date range
+    const now = new Date();
+    let startDate;
+    
+    switch (period) {
+      case '1d':
+        startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        break;
+      case '7d':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case '30d':
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      case '90d':
+        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    }
+    
+    // Get scans in period
+    const scans = await prisma.qrCodeScan.findMany({
+      where: {
+        qrCodeId: id,
+        scannedAt: { gte: startDate }
+      },
+      orderBy: { scannedAt: 'desc' }
+    });
+    
+    // Calculate time-based stats
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    
+    const scansToday = scans.filter(s => s.scannedAt >= todayStart).length;
+    const scansThisWeek = scans.filter(s => s.scannedAt >= weekStart).length;
+    const scansThisMonth = scans.filter(s => s.scannedAt >= monthStart).length;
+    
+    // Process analytics with proper structure for frontend
+    const scansByDevice = {};
+    const scansByBrowser = {};
+    const scansByOS = {};
+    const scansByCountry = {};
+    const scansByDate = {};
+    
+    scans.forEach(scan => {
+      // Device breakdown
+      const device = scan.device || 'Unknown';
+      scansByDevice[device] = (scansByDevice[device] || 0) + 1;
+      
+      // Browser breakdown
+      const browser = scan.browser || 'Unknown';
+      scansByBrowser[browser] = (scansByBrowser[browser] || 0) + 1;
+      
+      // OS breakdown
+      const os = scan.os || 'Unknown';
+      scansByOS[os] = (scansByOS[os] || 0) + 1;
+      
+      // Country breakdown
+      const country = scan.country || 'Unknown';
+      scansByCountry[country] = (scansByCountry[country] || 0) + 1;
+      
+      // Daily breakdown
+      const day = scan.scannedAt.toISOString().split('T')[0];
+      scansByDate[day] = (scansByDate[day] || 0) + 1;
+    });
+    
+    // Convert objects to arrays for frontend
+    const analytics = {
+      totalScans: scans.length,
+      uniqueScans: new Set(scans.map(s => s.ipAddress)).size,
+      scansToday,
+      scansThisWeek,
+      scansThisMonth,
+      scansByDevice: Object.entries(scansByDevice).map(([device, count]) => ({ device, count })),
+      scansByBrowser: Object.entries(scansByBrowser).map(([browser, count]) => ({ browser, count })),
+      scansByOS: Object.entries(scansByOS).map(([os, count]) => ({ os, count })),
+      scansByCountry: Object.entries(scansByCountry).map(([country, count]) => ({ country, count })),
+      scansByDate: Object.entries(scansByDate).map(([date, count]) => ({ date, count })).sort((a, b) => a.date.localeCompare(b.date)),
+      recentScans: scans.slice(0, 10)
+    };
+    
+    res.json(analytics);
+  } catch (error) {
+    console.error('Error fetching QR code analytics:', error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// ============================================
+// SUBSCRIPTION PLANS API
+// ============================================
+
+// Get all subscription plans
+app.get('/api/subscription-plans', async (req, res) => {
+  try {
+    const plans = await prisma.subscriptionPlan.findMany({
+      where: { isActive: true },
+      orderBy: { price: 'asc' }
+    });
+    res.json(plans);
+  } catch (error) {
+    console.error('Error fetching subscription plans:', error);
+    res.status(500).json({ error: 'Failed to fetch subscription plans' });
+  }
+});
+
+// Get user's current subscription
+app.get('/api/users/:userId/subscription', auth, requireSelfOrAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const subscription = await prisma.userSubscription.findFirst({
+      where: {
+        userId: parseInt(userId),
+        status: 'ACTIVE'
+      },
+      include: {
+        plan: true
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+    
+    res.json(subscription);
+  } catch (error) {
+    console.error('Error fetching user subscription:', error);
+    res.status(500).json({ error: 'Failed to fetch subscription' });
+  }
+});
+
+// Create/Subscribe to a plan
+app.post('/api/subscriptions', auth, async (req, res) => {
+  try {
+    const { planId } = req.body;
+    
+    if (!planId) {
+      return res.status(400).json({ error: 'Plan ID is required' });
+    }
+    
+    // Check if plan exists
+    const plan = await prisma.subscriptionPlan.findUnique({
+      where: { id: planId }
+    });
+    
+    if (!plan || !plan.isActive) {
+      return res.status(404).json({ error: 'Plan not found or inactive' });
+    }
+    
+    // Check if user already has an active subscription
+    const existingSubscription = await prisma.userSubscription.findFirst({
+      where: {
+        userId: req.user.id,
+        status: 'ACTIVE'
+      }
+    });
+    
+    if (existingSubscription) {
+      return res.status(400).json({ error: 'User already has an active subscription' });
+    }
+    
+    // Calculate dates
+    const startDate = new Date();
+    let endDate = new Date(startDate);
+    
+    switch (plan.billingInterval) {
+      case 'monthly':
+        endDate.setMonth(endDate.getMonth() + 1);
+        break;
+      case 'yearly':
+        endDate.setFullYear(endDate.getFullYear() + 1);
+        break;
+      case 'weekly':
+        endDate.setDate(endDate.getDate() + 7);
+        break;
+      case 'daily':
+        endDate.setDate(endDate.getDate() + 1);
+        break;
+      default:
+        endDate.setMonth(endDate.getMonth() + 1);
+    }
+    
+    // For free plans or trial
+    const isFree = plan.price === 0;
+    const trialEndsAt = isFree ? new Date(Date.now() + 10 * 24 * 60 * 60 * 1000) : null; // 10 days trial
+    
+    // Create subscription
+    const subscription = await prisma.userSubscription.create({
+      data: {
+        userId: req.user.id,
+        planId: plan.id,
+        status: isFree ? 'ACTIVE' : 'PENDING',
+        startDate,
+        endDate,
+        nextBillingDate: endDate,
+        autoRenew: true,
+        trialEndsAt
+      },
+      include: {
+        plan: true
+      }
+    });
+    
+    res.json(subscription);
+  } catch (error) {
+    console.error('Error creating subscription:', error);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+// Cancel subscription
+app.delete('/api/subscriptions/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const subscription = await prisma.userSubscription.findFirst({
+      where: {
+        id,
+        userId: req.user.id
+      }
+    });
+    
+    if (!subscription) {
+      return res.status(404).json({ error: 'Subscription not found' });
+    }
+    
+    // Update subscription status
+    const updatedSubscription = await prisma.userSubscription.update({
+      where: { id },
+      data: {
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+        autoRenew: false
+      }
+    });
+    
+    res.json(updatedSubscription);
+  } catch (error) {
+    console.error('Error cancelling subscription:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+// Serve static files from the frontend build directory (only if it exists)
+const frontendPath = path.join(__dirname, '../frontend/dist');
+if (fs.existsSync(frontendPath)) {
+  app.use(express.static(frontendPath));
+  
+  // Catch-all handler: send back React's index.html file for any non-API routes
+  app.get('*', (req, res) => {
+    // Only serve index.html for non-API routes
+    if (!req.path.startsWith('/api/')) {
+      res.sendFile(path.join(frontendPath, 'index.html'));
+    } else {
+      res.status(404).json({ error: 'API endpoint not found' });
+    }
+  });
+} else {
+  // If frontend doesn't exist, just return 404 for non-API routes
+  app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api/')) {
+      res.status(404).json({ error: 'Frontend not found' });
+    } else {
+      res.status(404).json({ error: 'API endpoint not found' });
+    }
+  });
+}
 
 initializeAndStart();
 
